@@ -1053,7 +1053,9 @@ next request starts a new conversation.
 1. If the last task of the conversation was still running when it was last seen, the toolkit reads it and waits for
    it as in step 5, before sending anything. If it has settled, the result is its reply (step 6) followed by a note
    that the new request was not sent, so that the model can send it again. If it is still running, the result is the
-   `[WORKING]` reply. If it cannot be read, the conversation is forgotten and the request is sent as in step 2.
+   `[WORKING]` reply. If the remote agent no longer knows the task (`a2a:TaskNotFoundError`), the conversation is
+   forgotten and the request is sent as in step 2. Any other failure to read it is returned as an error, and the
+   conversation is kept, because the task may still be running.
 2. The toolkit sends a user message that contains `request` as its text, with the conversation's `contextId` when it
    has one.
    * If the last task is in `TASK_STATE_INPUT_REQUIRED` or `TASK_STATE_AUTH_REQUIRED`, the message continues that task

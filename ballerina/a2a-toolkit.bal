@@ -204,7 +204,13 @@ public isolated class A2aToolKit {
         string? pendingTaskId = conversation?.taskId;
         a2a:TaskState? pendingState = conversation?.taskState;
         if pendingTaskId is string && pendingState is a2a:TaskState && !isSettled(pendingState) {
-            a2a:Task|error pending = self.agentClient->getTask({id: pendingTaskId});
+            a2a:Task|a2a:Error pending = self.agentClient->getTask({id: pendingTaskId});
+            if pending is a2a:Error && pending !is a2a:TaskNotFoundError {
+                // The agent could not be reached or failed; the task may still be running, so the conversation is
+                // kept and nothing new is sent.
+                return error Error(string `agent call "${self.toolName}" failed while reading the earlier request: `
+                    + pending.message(), pending);
+            }
             if pending is a2a:Task {
                 a2a:Task settled = check self.pollUntilSettled(pending);
                 self.remember(session, settled);
@@ -214,8 +220,8 @@ public isolated class A2aToolKit {
                         + "you just sent was not delivered; send it again if it is still needed.)"
                     : reply;
             }
-            // The task is gone, for example because the remote agent restarted. Nothing can be read from it, so
-            // the conversation starts over.
+            // The remote agent no longer knows the task, for example because it restarted. Nothing can be read
+            // from it, so the conversation starts over.
             log:printWarn("A task left running on the remote agent can no longer be read; starting over",
                     tool = self.toolName, taskId = pendingTaskId);
             self.forget(session);

@@ -396,6 +396,20 @@ function testA2aAskStartsOverWhenTheRunningTaskIsGone() returns error? {
 }
 
 @test:Config {groups: ["a2a"]}
+function testA2aAskKeepsTheConversationWhenTheRunningTaskCannotBeReached() returns error? {
+    A2aToolKit toolkit = check new (a2aCard("Unreachable"));
+    toolkit.store(DEFAULT_SESSION_ID, {contextId: "ctx-1", taskId: "task-1", taskState: a2a:TASK_STATE_WORKING});
+    string|error reply = a2aAsk(toolkit, "echo are you there?");
+    if reply is string {
+        test:assertFail("expected an error: nothing listens at the card's address");
+    }
+    test:assertTrue(reply.message().includes("earlier request"), reply.message());
+    // The task may still be running, so the conversation is not dropped.
+    test:assertEquals(toolkit.conversationOf(DEFAULT_SESSION_ID),
+            {contextId: "ctx-1", taskId: "task-1", taskState: a2a:TASK_STATE_WORKING});
+}
+
+@test:Config {groups: ["a2a"]}
 function testA2aAskOverAnUnreachableAgentIsAnError() returns error? {
     A2aToolKit toolkit = check new (a2aCard("Gone"));
     string|error reply = a2aAsk(toolkit, "anyone there?");
