@@ -16,43 +16,16 @@
 
 import ballerina/a2a;
 import ballerina/http;
+import ballerina/jballerina.java;
+import ballerina/lang.runtime;
 import ballerina/test;
-import ballerina/time;
 
 // ---- helpers ---------------------------------------------------------------
-
-// `ToolConfig.caller` is an opaque `isolated function` that an agent calls by reflection over the model's named
-// arguments. The tests cast it back to the signature the toolkit assigned, so each one calls the real
-// implementation through the same public surface an agent uses.
-isolated function a2aFindTool(ToolConfig[] tools, string name) returns ToolConfig {
-    foreach ToolConfig tool in tools {
-        if tool.name == name {
-            return tool;
-        }
-    }
-    test:assertFail(string `tool "${name}" was not generated`);
-}
-
-isolated function a2aToolNames(ToolConfig[] tools) returns string[] =>
-    from ToolConfig tool in tools
-select tool.name;
-
-// Pulls the id back out of `summarize`'s "[STATE] text (task id: X)": the only way the model, or a test, learns a
-// task id.
-isolated function a2aExtractTaskId(string summary) returns string {
-    string marker = "(task id: ";
-    int? idx = summary.lastIndexOf(marker);
-    if idx is () {
-        test:assertFail(string `no task id in summary: ${summary}`);
-    }
-    string tail = summary.substring(idx + marker.length());
-    return tail.substring(0, tail.length() - 1);
-}
 
 const int A2A_EXTENDED_CARD_TEST_PORT = 19302;
 
 // A card that is never fetched. Building the client only checks that an HTTP+JSON interface exists and builds an
-// `http:Client`, which connects to nothing until a tool is called.
+// `http:Client`, which connects to nothing until the tool is called.
 isolated function a2aCard(string name, a2a:SecurityRequirement[]? securityRequirements = (),
         string description = "A card that is never fetched over the wire", a2a:AgentSkill[] skills = [],
         a2a:AgentInterface[] interfaces = [
@@ -61,12 +34,12 @@ isolated function a2aCard(string name, a2a:SecurityRequirement[]? securityRequir
                 protocolBinding: "HTTP+JSON",
                 protocolVersion: "1.0"
             }
-        ], boolean streaming = false, boolean extendedAgentCard = false)
+        ], boolean extendedAgentCard = false)
         returns a2a:AgentCard => {
     name,
     description,
     version: "1.0.0",
-    capabilities: {streaming, extendedAgentCard},
+    capabilities: {extendedAgentCard},
     supportedInterfaces: interfaces,
     defaultInputModes: ["text"],
     defaultOutputModes: ["text"],
@@ -74,13 +47,22 @@ isolated function a2aCard(string name, a2a:SecurityRequirement[]? securityRequir
     securityRequirements
 };
 
-isolated function a2aDelegate(A2aToolKit toolkit, string toolName) returns isolated function (string, string?)
-        returns string|error => <isolated function (string, string?) returns string|error>
-    a2aFindTool(toolkit.getTools(), toolName).caller;
+isolated function a2aOnlyTool(A2aToolKit toolkit) returns ToolConfig {
+    ToolConfig[] tools = toolkit.getTools();
+    test:assertEquals(tools.length(), 1, "an A2A toolkit gives exactly one tool");
+    return tools[0];
+}
 
-isolated function a2aCall(A2aToolKit toolkit, string toolName, string message) returns string|error {
-    isolated function (string, string?) returns string|error delegate = a2aDelegate(toolkit, toolName);
-    return delegate(message, ());
+// Calls the tool the way an agent does: the agent supplies the `ai:Context` of the run, carrying its session id, and
+// the model supplies `request`.
+isolated function a2aAsk(A2aToolKit toolkit, string request, string? session = ()) returns string|error {
+    Context context = new;
+    if session is string {
+        context.setSessionId(session);
+    }
+    isolated function (Context, string) returns string|error ask =
+        <isolated function (Context, string) returns string|error>a2aOnlyTool(toolkit).caller;
+    return ask(context, request);
 }
 
 // ---- construction ------------------------------------------------------------
@@ -115,7 +97,7 @@ function testA2aToolKitRejectsSchemesThatNeedSeveralSecrets() {
 @test:Config {groups: ["a2a"]}
 function testA2aToolKitAcceptsASecretForADeclaredScheme() returns error? {
     A2aToolKit toolkit = check new (a2aCard("Secured", [{"bearer": []}]), secret = "shh");
-    test:assertEquals(toolkit.getTools().length(), 4);
+    test:assertEquals(a2aOnlyTool(toolkit).name, "askSecured");
 }
 
 @test:Config {groups: ["a2a"]}
@@ -132,57 +114,69 @@ function testA2aToolKitNamesTheBindingsAnAgentDoesOffer() {
 }
 
 @test:Config {groups: ["a2a"]}
-function testOnlyOptedInA2aToolGroupsAreGenerated() returns error? {
-    A2aToolKit core = check new (a2aScriptedAgentUrl);
-    test:assertEquals(a2aToolNames(core.getTools()), [
-                "delegateToScriptedAgent",
-                "getScriptedAgentTaskStatus",
-                "cancelScriptedAgentTask",
-                "listScriptedAgentTasks"
-            ]);
-
-    A2aToolKit pushOnly = check new (a2aScriptedAgentUrl, toolSet = {core: false, pushNotifications: true});
-    test:assertEquals(a2aToolNames(pushOnly.getTools()), [
-                "createScriptedAgentPushNotificationConfig",
-                "listScriptedAgentPushNotificationConfigs",
-                "deleteScriptedAgentPushNotificationConfig"
-            ]);
-
-    A2aToolKit everything = check new (a2aScriptedAgentUrl,
-        toolSet = {streaming: true, extendedCard: true, pushNotifications: true}
-    );
-    // core 4 + streaming 2 + extendedCard 1 + pushNotifications 3
-    test:assertEquals(everything.getTools().length(), 10);
+function testA2aInvalidPollConfigIsRejected() {
+    A2aToolKit|Error noInterval = new (a2aCard("Bad Poll"), pollConfig = {pollInterval: 0});
+    if noInterval is A2aToolKit {
+        test:assertFail("expected construction to fail: pollInterval must be greater than zero");
+    }
+    test:assertTrue(noInterval.message().includes("pollInterval"), noInterval.message());
+    A2aToolKit|Error negativeWait = new (a2aCard("Bad Poll"), pollConfig = {maxWait: -1});
+    if negativeWait is A2aToolKit {
+        test:assertFail("expected construction to fail: maxWait must not be negative");
+    }
+    test:assertTrue(negativeWait.message().includes("maxWait"), negativeWait.message());
 }
 
-// ---- names ---------------------------------------------------------------------
+// ---- the one tool ------------------------------------------------------------
 
 @test:Config {groups: ["a2a"]}
-function testA2aToolKitBuildsToolNamesFromTheGivenName() returns error? {
-    A2aToolKit toolkit = check new (a2aCard("Whatever The Card Says"), name = "tripPlanner");
-    test:assertEquals(a2aToolNames(toolkit.getTools()), [
-                "delegateToTripPlanner",
-                "getTripPlannerTaskStatus",
-                "cancelTripPlannerTask",
-                "listTripPlannerTasks"
-            ]);
+function testA2aToolKitGivesOneToolThatTakesOnlyTheRequest() returns error? {
+    A2aToolKit toolkit = check new (a2aScriptedAgentUrl);
+    ToolConfig tool = a2aOnlyTool(toolkit);
+    test:assertEquals(tool.name, "askScriptedAgent");
+    test:assertEquals(tool.parameters, {
+        "type": "object",
+        "properties": {"request": {"type": "string", "description": "The request or answer, in plain language."}},
+        "required": ["request"]
+    });
+    test:assertTrue(tool.description.includes("[INPUT_REQUIRED]"), tool.description);
+    test:assertTrue(tool.description.includes("[WORKING]"), tool.description);
+    test:assertTrue(tool.description.includes("Follows fixed triggers"), "the card's skills describe the tool");
+    test:assertEquals(tool.requiresApproval, false);
+}
+
+@test:Config {groups: ["a2a"]}
+function testA2aToolKitBuildsTheToolNameFromTheGivenName() returns error? {
+    A2aToolKit toolkit = check new (a2aCard("Card Name"), name = "tripPlanner");
+    test:assertEquals(a2aOnlyTool(toolkit).name, "askTripPlanner");
+}
+
+@test:Config {groups: ["a2a"]}
+function testA2aToolKitPassesRequiresApprovalToItsTool() returns error? {
+    A2aToolKit always = check new (a2aCard("Gated"), requiresApproval = true);
+    test:assertEquals(a2aOnlyTool(always).requiresApproval, true);
+
+    isolated function (string request) returns boolean onlyRefunds = isolated function(string request) returns boolean
+        => request.includes("refund");
+    A2aToolKit predicate = check new (a2aCard("Gated"), requiresApproval = onlyRefunds);
+    test:assertTrue(a2aOnlyTool(predicate).requiresApproval is isolated function);
 }
 
 @test:Config {groups: ["a2a"]}
 function testTwoA2aToolKitsInOneToolStoreDoNotCollide() returns error? {
-    A2aToolKit tripPlanner = check new (a2aCard("Assistant"), name = "tripPlanner");
-    A2aToolKit packing = check new (a2aCard("Assistant"), name = "packing");
-    ToolStore store = check new (tripPlanner, packing);
-    test:assertEquals(store.tools.length(), 8);
+    A2aToolKit first = check new (a2aCard("First Agent"));
+    A2aToolKit second = check new (a2aCard("Second Agent"));
+    ToolStore store = check new (first, second);
+    test:assertEquals(store.tools.keys().sort(), ["askFirstAgent", "askSecondAgent"]);
 }
 
 @test:Config {groups: ["a2a"]}
 function testTwoA2aToolKitsWithTheSameNameAreRejected() returns error? {
-    A2aToolKit first = check new (a2aCard("Assistant"));
-    A2aToolKit second = check new (a2aCard("Assistant"));
+    A2aToolKit first = check new (a2aCard("Twin"));
+    A2aToolKit second = check new (a2aCard("Twin"));
     ToolStore|Error store = new (first, second);
     if store is ToolStore {
-        test:assertFail("expected the duplicate tool names to be rejected");
+        test:assertFail("expected the tool store to reject two tools with the same name");
     }
     test:assertTrue(store.message().includes("duplicate tool name found"), store.message());
 }
@@ -190,23 +184,22 @@ function testTwoA2aToolKitsWithTheSameNameAreRejected() returns error? {
 @test:Config {groups: ["a2a"]}
 function testALongA2aNameIsShortenedWithAHash() returns error? {
     string longName = "The Extraordinarily Long Named Remote Agent For Planning Long Journeys Abroad";
-    A2aToolKit first = check new (a2aCard(longName));
-    A2aToolKit again = check new (a2aCard(longName));
-    A2aToolKit sibling = check new (a2aCard(longName + " Two"));
+    A2aToolKit firstKit = check new (a2aCard(longName));
+    A2aToolKit againKit = check new (a2aCard(longName));
+    A2aToolKit siblingKit = check new (a2aCard(longName + " Two"));
+    string first = a2aOnlyTool(firstKit).name;
 
-    foreach string toolName in a2aToolNames(first.getTools()) {
-        test:assertTrue(toolName.length() <= 64, toolName);
-        test:assertTrue(toolName.matches(re `^[a-zA-Z0-9_-]{1,64}$`), toolName);
-    }
-    test:assertEquals(a2aToolNames(first.getTools()), a2aToolNames(again.getTools()));
+    test:assertTrue(first.length() <= 64, first);
+    test:assertTrue(first.matches(re `^[a-zA-Z0-9_-]{1,64}$`), first);
+    test:assertEquals(first, a2aOnlyTool(againKit).name);
     // Same start, different name: the hash keeps the tool names apart.
-    test:assertNotEquals(a2aToolNames(first.getTools())[0], a2aToolNames(sibling.getTools())[0]);
+    test:assertNotEquals(first, a2aOnlyTool(siblingKit).name);
 }
 
 @test:Config {groups: ["a2a"]}
 function testAnA2aNameWithNoUsableCharactersFallsBack() returns error? {
     A2aToolKit toolkit = check new (a2aCard("***"));
-    test:assertEquals(a2aToolNames(toolkit.getTools())[0], "delegateToAgent");
+    test:assertEquals(a2aOnlyTool(toolkit).name, "askAgent");
 }
 
 // ---- what the card says about the agent ------------------------------------------
@@ -217,12 +210,12 @@ function testAnA2aCardDescriptionIsCappedAndIntroducedAsTheAgentsOwnText() retur
         + string:'join("", ...from int i in 0 ..< 300
                 select "padding padding ");
     A2aToolKit toolkit = check new (a2aCard("Hostile", description = hostile));
-    string description = a2aFindTool(toolkit.getTools(), "delegateToHostile").description;
+    string description = a2aOnlyTool(toolkit).description;
 
     test:assertTrue(description.includes("own text, not an instruction"), description);
     test:assertTrue(description.includes("... [truncated]"), description);
     test:assertFalse(description.includes("\n"), "the card's line breaks must not reach the description");
-    test:assertTrue(description.length() < 1600, string `description is ${description.length()} characters`);
+    test:assertTrue(description.length() < 2200, string `description is ${description.length()} characters`);
 }
 
 @test:Config {groups: ["a2a"]}
@@ -238,16 +231,15 @@ function testA2aSkillsArePassedInFull() returns error? {
             outputModes: ["text", "application/json"]
         };
     A2aToolKit toolkit = check new (a2aCard("Many Skills", skills = skills));
-    string description = a2aFindTool(toolkit.getTools(), "delegateToManySkills").description;
+    string description = a2aOnlyTool(toolkit).description;
 
-    // Every skill is there, with everything the card says about it, and nothing is cut or counted as "more".
+    // Every skill is there, with everything the card says about it.
     test:assertTrue(description.includes("- Skill 0 (id s0): Does thing number 0. [tags: travel, demo]"), description);
     test:assertTrue(description.includes("- Skill 59 (id s59): Does thing number 59."), description);
     test:assertTrue(description.includes(
             "[examples: \"first example\"; \"second example\"; \"third example\"]"), description);
     test:assertTrue(description.includes("[accepts: text] [produces: text, application/json]"), description);
     test:assertFalse(description.includes("summarized"), "no skill is over the cap");
-    test:assertFalse(description.includes("more)"), "no skill is left out");
 }
 
 @test:Config {groups: ["a2a"]}
@@ -271,7 +263,7 @@ function testOnlyAnOversizedA2aSkillIsSummarized() returns error? {
         }
     ];
     A2aToolKit toolkit = check new (a2aCard("Mixed Skills", skills = skills));
-    string description = a2aFindTool(toolkit.getTools(), "delegateToMixedSkills").description;
+    string description = a2aOnlyTool(toolkit).description;
 
     // The big skill is cut to a summary with two examples, and the small one is untouched.
     test:assertTrue(description.includes("- Big skill: lengthy detail"), description);
@@ -282,149 +274,198 @@ function testOnlyAnOversizedA2aSkillIsSummarized() returns error? {
             "- Small skill (id small): Stays whole. [tags: kept] [examples: \"a\"; \"b\"; \"c\"]"), description);
 }
 
-// ---- delegateTo<Name>: a fresh task that completes at once -----------------------
+// ---- calling the remote agent ------------------------------------------------------
 
 @test:Config {groups: ["a2a"]}
-function testA2aDelegateEchoCompletes() returns error? {
+function testA2aAskReturnsTheAnswerOfACompletedTask() returns error? {
     A2aToolKit toolkit = check new (a2aScriptedAgentUrl);
-    string result = check a2aCall(toolkit, "delegateToScriptedAgent", "echo hello");
-    test:assertTrue(result.startsWith("[TASK_STATE_COMPLETED] hello"), result);
+    test:assertEquals(check a2aAsk(toolkit, "echo hello"), "hello");
 }
 
-// `delegateTo<Name>` always sends with `returnImmediately`, so a direct Message reply to a fresh message comes
-// back as a completed task wrapping that reply: the listener completes the placeholder task rather than leaving
-// it at SUBMITTED.
 @test:Config {groups: ["a2a"]}
-function testA2aDelegateDirectReplyCompletesTheTask() returns error? {
+function testA2aAskReturnsADirectReply() returns error? {
     A2aToolKit toolkit = check new (a2aScriptedAgentUrl);
-    string result = check a2aCall(toolkit, "delegateToScriptedAgent", "hello there");
-    test:assertTrue(result.startsWith("[TASK_STATE_COMPLETED] direct: hello there"), result);
+    test:assertEquals(check a2aAsk(toolkit, "hi"), "direct: hi");
 }
 
 @test:Config {groups: ["a2a"]}
-function testA2aDelegateInputRequiredThenContinues() returns error? {
+function testA2aAskReportsAFailedTask() returns error? {
     A2aToolKit toolkit = check new (a2aScriptedAgentUrl);
-    isolated function (string, string?) returns string|error delegate = a2aDelegate(toolkit, "delegateToScriptedAgent");
-
-    string asked = check delegate("ask", ());
-    test:assertTrue(asked.startsWith("[TASK_STATE_INPUT_REQUIRED] which one?"), asked);
-    string taskId = a2aExtractTaskId(asked);
-
-    string continued = check delegate("the blue one", taskId);
-    test:assertTrue(continued.startsWith("[TASK_STATE_COMPLETED] the blue one"), continued);
-    test:assertEquals(a2aExtractTaskId(continued), taskId);
+    string reply = check a2aAsk(toolkit, "boom");
+    test:assertTrue(reply.startsWith("[TASK_STATE_FAILED]"), reply);
+    test:assertTrue(reply.includes("scripted agent failure"), reply);
 }
 
 @test:Config {groups: ["a2a"]}
-function testA2aDelegateReportsAnAgentFailure() returns error? {
+function testA2aAskAnswersAQuestionWithoutTheModelSeeingTheTask() returns error? {
     A2aToolKit toolkit = check new (a2aScriptedAgentUrl);
-    string result = check a2aCall(toolkit, "delegateToScriptedAgent", "boom");
-    test:assertTrue(result.startsWith("[TASK_STATE_FAILED] scripted agent failure"), result);
+    string question = check a2aAsk(toolkit, "ask");
+    test:assertTrue(question.startsWith("[INPUT_REQUIRED] which one?"), question);
+    test:assertTrue(question.includes("call askScriptedAgent again"), question);
+    test:assertFalse(question.includes("task id"), "the model never sees a task id");
+
+    // The scripted agent echoes a message sent to an existing task, and answers a fresh one with "direct: ".
+    // The plain answer is delivered to the open task: the toolkit carried the task over, not the model.
+    test:assertEquals(check a2aAsk(toolkit, "the red one"), "the red one");
+    // That task is done, so the next request is a new task again.
+    test:assertEquals(check a2aAsk(toolkit, "next"), "direct: next");
 }
 
 @test:Config {groups: ["a2a"]}
-function testA2aDelegateReportsATaskStillWorkingWhenTheWaitRunsOut() returns error? {
-    A2aToolKit toolkit = check new (a2aScriptedAgentUrl, pollConfig = {pollInterval: 0.1, maxWait: 1});
-    time:Utc before = time:utcNow();
-    string result = check a2aCall(toolkit, "delegateToScriptedAgent", "slow");
-    test:assertTrue(result.startsWith("[TASK_STATE_WORKING]"), result);
-    test:assertTrue(time:utcDiffSeconds(time:utcNow(), before) < 10d, "the configured wait was not used");
+function testA2aAskKeepsTheConversationAndPointsAtTheLastTask() returns error? {
+    A2aToolKit toolkit = check new (a2aScriptedAgentUrl);
+    _ = check a2aAsk(toolkit, "echo first");
+    A2aConversation afterFirst = toolkit.conversationOf(DEFAULT_SESSION_ID);
+    string contextId = afterFirst?.contextId ?: "";
+    string firstTaskId = afterFirst?.taskId ?: "";
+    test:assertNotEquals(contextId, "", "the remote agent's context is remembered");
+
+    // A new task in the same conversation: same context, and it points at the task before it.
+    test:assertEquals(check a2aAsk(toolkit, "ids"), string `context=${contextId} refs=${firstTaskId}`);
 }
 
 @test:Config {groups: ["a2a"]}
-function testA2aDelegateWithNoWaitReturnsTheTaskAsFirstReported() returns error? {
+function testA2aAskKeepsSessionsApart() returns error? {
+    A2aToolKit toolkit = check new (a2aScriptedAgentUrl);
+    string question = check a2aAsk(toolkit, "ask", "alice");
+    test:assertTrue(question.startsWith("[INPUT_REQUIRED]"), question);
+
+    // Bob has his own conversation: his request is not taken as Alice's answer.
+    test:assertEquals(check a2aAsk(toolkit, "hello from bob", "bob"), "direct: hello from bob");
+    test:assertNotEquals(toolkit.conversationOf("alice")?.contextId, toolkit.conversationOf("bob")?.contextId);
+
+    // Alice's task is still open for her answer.
+    test:assertEquals(check a2aAsk(toolkit, "the blue one", "alice"), "the blue one");
+}
+
+@test:Config {groups: ["a2a"]}
+function testA2aAskReportsAStillRunningTaskAndPicksItUpLater() returns error? {
+    // A wait shorter than the one second "brief" takes, but long enough for an echo.
+    A2aToolKit toolkit = check new (a2aScriptedAgentUrl, pollConfig = {pollInterval: 0.1, maxWait: 0.3});
+    string first = check a2aAsk(toolkit, "brief");
+    test:assertTrue(first.startsWith("[WORKING]"), first);
+    test:assertFalse(first.includes("task id"), "the model never sees a task id");
+
+    // By the next call the task has finished. Its result comes back, and the new request is held back, because
+    // sending it would have started a second task and lost this result.
+    runtime:sleep(1.5);
+    string later = check a2aAsk(toolkit, "echo is it done?");
+    test:assertTrue(later.startsWith("brief work finished"), later);
+    test:assertTrue(later.includes("was not delivered"), later);
+
+    // With nothing pending, the request goes through.
+    test:assertEquals(check a2aAsk(toolkit, "echo is it done?"), "is it done?");
+}
+
+@test:Config {groups: ["a2a"]}
+function testA2aAskWithNoWaitReturnsTheTaskAsFirstReported() returns error? {
     A2aToolKit toolkit = check new (a2aScriptedAgentUrl, pollConfig = {maxWait: 0});
-    string result = check a2aCall(toolkit, "delegateToScriptedAgent", "brief");
-    test:assertFalse(result.startsWith("[TASK_STATE_COMPLETED]"), result);
+    string reply = check a2aAsk(toolkit, "brief");
+    test:assertTrue(reply.startsWith("[WORKING]"), reply);
 }
 
 @test:Config {groups: ["a2a"]}
-function testA2aDelegateWaitsLongerWhenConfiguredTo() returns error? {
-    A2aToolKit toolkit = check new (a2aScriptedAgentUrl, pollConfig = {pollInterval: 0.2, maxWait: 10});
-    string result = check a2aCall(toolkit, "delegateToScriptedAgent", "brief");
-    test:assertTrue(result.startsWith("[TASK_STATE_COMPLETED] brief work finished"), result);
+function testA2aAskWaitsForATaskWhileTheWaitAllows() returns error? {
+    A2aToolKit toolkit = check new (a2aScriptedAgentUrl, pollConfig = {pollInterval: 0.1, maxWait: 3});
+    test:assertEquals(check a2aAsk(toolkit, "brief"), "brief work finished");
 }
 
 @test:Config {groups: ["a2a"]}
-function testA2aInvalidPollConfigIsRejected() {
-    A2aToolKit|Error zeroInterval = new (a2aCard("Polled"), pollConfig = {pollInterval: 0});
-    test:assertTrue(zeroInterval is Error && zeroInterval.message().includes("pollInterval"),
-            "a zero pollInterval was accepted");
-    A2aToolKit|Error negativeWait = new (a2aCard("Polled"), pollConfig = {maxWait: -1});
-    test:assertTrue(negativeWait is Error && negativeWait.message().includes("maxWait"),
-            "a negative maxWait was accepted");
+function testA2aAskKeepsReportingATaskThatNeverFinishes() returns error? {
+    A2aToolKit toolkit = check new (a2aScriptedAgentUrl, pollConfig = {pollInterval: 0.1, maxWait: 0.3});
+    string first = check a2aAsk(toolkit, "slow");
+    test:assertTrue(first.startsWith("[WORKING]"), first);
+    string second = check a2aAsk(toolkit, "echo anything new?");
+    test:assertTrue(second.startsWith("[WORKING]"), second);
 }
 
-// ---- status, cancel, list ------------------------------------------------------------
-
 @test:Config {groups: ["a2a"]}
-function testA2aGetCancelAndListTasks() returns error? {
+function testA2aAskStartsOverWhenTheOpenTaskIsUnknown() returns error? {
     A2aToolKit toolkit = check new (a2aScriptedAgentUrl);
-    ToolConfig[] tools = toolkit.getTools();
-    isolated function (string) returns string|error status =
-        <isolated function (string) returns string|error>a2aFindTool(tools, "getScriptedAgentTaskStatus").caller;
-    isolated function (string) returns string|error cancel =
-        <isolated function (string) returns string|error>a2aFindTool(tools, "cancelScriptedAgentTask").caller;
-    isolated function () returns string|error list =
-        <isolated function () returns string|error>a2aFindTool(tools, "listScriptedAgentTasks").caller;
-
-    string asked = check a2aCall(toolkit, "delegateToScriptedAgent", "ask");
-    string taskId = a2aExtractTaskId(asked);
-
-    test:assertTrue((check status(taskId)).startsWith("[TASK_STATE_INPUT_REQUIRED]"));
-    test:assertTrue((check cancel(taskId)).startsWith("[TASK_STATE_CANCELED]"));
-    test:assertTrue((check list()).includes(taskId));
+    // As if the remote agent restarted and lost a task that was waiting on an answer.
+    toolkit.store(DEFAULT_SESSION_ID, {taskId: "no-such-task", taskState: a2a:TASK_STATE_INPUT_REQUIRED});
+    test:assertEquals(check a2aAsk(toolkit, "the green one"), "direct: the green one");
+    test:assertNotEquals(toolkit.conversationOf(DEFAULT_SESSION_ID)?.taskId, "no-such-task");
 }
 
-// ---- subscribe, extended card, push notifications ---------------------------------------
+@test:Config {groups: ["a2a"]}
+function testA2aAskStartsOverWhenTheRunningTaskIsGone() returns error? {
+    A2aToolKit toolkit = check new (a2aScriptedAgentUrl);
+    toolkit.store(DEFAULT_SESSION_ID, {taskId: "vanished-task", taskState: a2a:TASK_STATE_WORKING});
+    test:assertEquals(check a2aAsk(toolkit, "echo after the restart"), "after the restart");
+}
 
-// Starts a task through the client and returns its id while it is still running, so a tool can act on it.
-isolated function a2aStartBriefTask() returns string|error {
-    a2a:AgentCard card = check a2a:resolveAgentCard(a2aScriptedAgentUrl);
-    a2a:RestClient scriptedClient = check new (card);
-    a2a:Task|a2a:Message started = check scriptedClient->sendMessage({
-        message: {messageId: "brief-1", role: a2a:ROLE_USER, parts: [{text: "brief"}]},
-        configuration: {returnImmediately: true}
-    });
-    if started is a2a:Message {
-        return error("expected a task for a 'brief' request");
+@test:Config {groups: ["a2a"]}
+function testA2aAskOverAnUnreachableAgentIsAnError() returns error? {
+    A2aToolKit toolkit = check new (a2aCard("Gone"));
+    string|error reply = a2aAsk(toolkit, "anyone there?");
+    if reply is string {
+        test:assertFail("expected an error: nothing listens at the card's address");
     }
-    return (<a2a:Task>started).id;
+    test:assertTrue(reply.message().includes("askGone"), reply.message());
 }
 
 @test:Config {groups: ["a2a"]}
-function testA2aSubscribeToATaskCollectsItsUpdates() returns error? {
-    A2aToolKit toolkit = check new (a2aScriptedAgentUrl, toolSet = {streaming: true});
-    string taskId = check a2aStartBriefTask();
-    isolated function (string) returns string|error subscribe =
-        <isolated function (string) returns string|error>a2aFindTool(toolkit.getTools(), "subscribeToScriptedAgentTask").caller;
-    string result = check subscribe(taskId);
-    test:assertTrue(result.includes("TASK_STATE_COMPLETED"), result);
-    test:assertTrue(result.includes("brief work finished"), result);
+function testA2aToolKitForgetsTheLeastRecentlyUsedConversation() returns error? {
+    A2aToolKit toolkit = check new (a2aCard("Busy"));
+    foreach int i in 0 ..< A2A_MAX_CONVERSATIONS + 1 {
+        toolkit.store(string `session-${i}`, {contextId: string `context-${i}`});
+    }
+    test:assertEquals(toolkit.conversationOf("session-0"), {}, "the oldest conversation is forgotten");
+    test:assertEquals(toolkit.conversationOf(string `session-${A2A_MAX_CONVERSATIONS}`),
+            {contextId: string `context-${A2A_MAX_CONVERSATIONS}`});
+}
+
+// ---- through an agent ------------------------------------------------------------
+
+// Calls the A2A tool with the user's query, then answers with what the tool returned.
+isolated client class A2aRelayMockLLM {
+    *ModelProvider;
+
+    isolated remote function chat(ChatMessage[]|ChatUserMessage messages, ChatCompletionFunctions[] tools = [],
+            string? stop = ()) returns ChatAssistantMessage|Error {
+        ChatMessage[] msgs;
+        if messages is ChatUserMessage {
+            msgs = [messages];
+        } else {
+            msgs = messages;
+        }
+        ChatMessage last = msgs[msgs.length() - 1];
+        if last is ChatFunctionMessage {
+            return {role: ASSISTANT, content: last.content ?: ""};
+        }
+        string query = last is ChatUserMessage ? getChatMessageStringContent(last.content) : "";
+        return {
+            role: ASSISTANT,
+            toolCalls: [{name: "askScriptedAgent", arguments: {"request": query}, id: "call-a2a"}]
+        };
+    }
+
+    isolated remote function generate(Prompt prompt, typedesc<anydata> td = <>) returns td|Error = @java:Method {
+        'class: "io.ballerina.lib.ai.MockGenerator"
+    } external;
 }
 
 @test:Config {groups: ["a2a"]}
-function testA2aPushNotificationConfigsCanBeCreatedListedAndDeleted() returns error? {
-    A2aToolKit toolkit = check new (a2aScriptedAgentUrl, toolSet = {pushNotifications: true});
-    ToolConfig[] tools = toolkit.getTools();
-    isolated function (string, string) returns string|error create =
-        <isolated function (string, string) returns string|error>a2aFindTool(tools, "createScriptedAgentPushNotificationConfig").caller;
-    isolated function (string) returns string|error list =
-        <isolated function (string) returns string|error>a2aFindTool(tools, "listScriptedAgentPushNotificationConfigs").caller;
-    isolated function (string, string) returns string|error delete =
-        <isolated function (string, string) returns string|error>a2aFindTool(tools, "deleteScriptedAgentPushNotificationConfig").caller;
+function testAnAgentKeepsOneRemoteConversationPerSession() returns error? {
+    A2aToolKit toolkit = check new (a2aScriptedAgentUrl);
+    Agent agent = check new (
+        systemPrompt = {role: "Concierge", instructions: "Relay requests to the scripted agent."},
+        model = new A2aRelayMockLLM(),
+        tools = [toolkit]
+    );
 
-    string taskId = a2aExtractTaskId(check a2aCall(toolkit, "delegateToScriptedAgent", "ask"));
-    string created = check create(taskId, "https://hook.example/a2a");
-    test:assertTrue(created.startsWith("Registered push notification config "), created);
-    string configId = created.substring("Registered push notification config ".length(),
-        <int>created.indexOf(" for task"));
-
-    test:assertTrue((check list(taskId)).includes(configId));
-    test:assertEquals(check delete(taskId, configId),
-            string `Deleted push notification config ${configId} from task ${taskId}.`);
-    test:assertEquals(check list(taskId), string `No push notification configs registered for task ${taskId}.`);
+    string question = check agent.run("ask", sessionId = "carol");
+    test:assertTrue(question.startsWith("[INPUT_REQUIRED] which one?"), question);
+    // Another session in between does not take over Carol's open task.
+    string dave = check agent.run("from dave", sessionId = "dave");
+    test:assertEquals(dave, "direct: from dave");
+    // Carol's answer continues her task: the agent passed her session id to the tool.
+    string answer = check agent.run("the large one", sessionId = "carol");
+    test:assertEquals(answer, "the large one");
 }
+
+// ---- the extended Agent Card -----------------------------------------------------
 
 listener http:Listener a2aExtendedCardListener = new (A2A_EXTENDED_CARD_TEST_PORT);
 
@@ -448,47 +489,30 @@ service / on a2aExtendedCardListener {
 }
 
 @test:Config {groups: ["a2a"]}
-function testA2aExtendedCardToolListsTheGatedSkills() returns error? {
+function testA2aToolDescribesTheExtendedCardWhenItCanBeRead() returns error? {
+    a2a:AgentCard card = a2aCard("Extended Agent", [{"bearer": []}], extendedAgentCard = true, interfaces = [
+                {url: string `http://localhost:${A2A_EXTENDED_CARD_TEST_PORT}`, protocolBinding: "HTTP+JSON", protocolVersion: "1.0"}
+            ], skills = [{id: "public", name: "Public", description: "Open to everyone", tags: []}]);
+    A2aToolKit toolkit = check new (card, secret = "shh");
+    string description = a2aOnlyTool(toolkit).description;
+    test:assertTrue(description.includes("Admin (id admin)"), "the gated skill from the extended card is described");
+}
+
+@test:Config {groups: ["a2a"]}
+function testA2aToolKeepsThePublicCardWhenTheExtendedOneCannotBeRead() returns error? {
+    // The card claims an extended card, but nothing serves one at this address.
+    a2a:AgentCard card = a2aCard("Claims Extended", [{"bearer": []}], extendedAgentCard = true,
+            skills = [{id: "open", name: "Open", description: "Open to everyone", tags: []}]);
+    A2aToolKit toolkit = check new (card, secret = "shh");
+    string description = a2aOnlyTool(toolkit).description;
+    test:assertTrue(description.includes("Open (id open)"), description);
+}
+
+@test:Config {groups: ["a2a"]}
+function testA2aToolKitDoesNotAskForTheExtendedCardWithoutACredential() returns error? {
     a2a:AgentCard card = a2aCard("Extended Agent", extendedAgentCard = true, interfaces = [
                 {url: string `http://localhost:${A2A_EXTENDED_CARD_TEST_PORT}`, protocolBinding: "HTTP+JSON", protocolVersion: "1.0"}
-            ]);
-    A2aToolKit toolkit = check new (card, toolSet = {extendedCard: true});
-    isolated function () returns string|error extended =
-        <isolated function () returns string|error>a2aFindTool(toolkit.getTools(), "getExtendedAgentExtendedCard").caller;
-    test:assertEquals(check extended(), "Extended Agent extended card: 2 skill(s): public, admin");
-}
-
-@test:Config {groups: ["a2a"]}
-function testA2aExtendedCardToolReturnsAnErrorWhenTheAgentHasNone() returns error? {
-    A2aToolKit toolkit = check new (a2aScriptedAgentUrl, toolSet = {extendedCard: true});
-    isolated function () returns string|error extended =
-        <isolated function () returns string|error>a2aFindTool(toolkit.getTools(), "getScriptedAgentExtendedCard").caller;
-    test:assertTrue(extended() is error, "an agent without an extended card must give an error");
-}
-
-// ---- streaming ---------------------------------------------------------------------------
-
-@test:Config {groups: ["a2a"]}
-function testStreamingToolsNeedTheCardToAdvertiseStreaming() returns error? {
-    A2aToolKit|error refused = new (a2aCard("Quiet Agent"), toolSet = {streaming: true});
-    if refused is A2aToolKit {
-        test:assertFail("expected construction to fail: the card does not advertise streaming");
-    }
-    test:assertTrue(refused.message().includes("does not advertise streaming"), refused.message());
-
-    // The same card is fine while streaming stays off, and a card that advertises it is fine with it on.
-    A2aToolKit plain = check new (a2aCard("Quiet Agent"));
-    test:assertEquals(plain.getTools().length(), 4);
-    A2aToolKit streaming = check new (a2aCard("Streaming Agent", streaming = true), toolSet = {streaming: true});
-    test:assertEquals(streaming.getTools().length(), 6);
-}
-
-@test:Config {groups: ["a2a"]}
-function testA2aStreamingToolCollectsTheStream() returns error? {
-    A2aToolKit toolkit = check new (a2aScriptedAgentUrl, toolSet = {streaming: true});
-    isolated function (string) returns string|error streamTool =
-        <isolated function (string) returns string|error>a2aFindTool(toolkit.getTools(), "streamFromScriptedAgent").caller;
-    string result = check streamTool("echo streamed");
-    test:assertTrue(result.includes("streamed"), result);
-    test:assertTrue(result.includes("TASK_STATE_COMPLETED"), result);
+            ], skills = [{id: "public", name: "Public", description: "Open to everyone", tags: []}]);
+    A2aToolKit toolkit = check new (card);
+    test:assertFalse(a2aOnlyTool(toolkit).description.includes("Admin"), "no credential, no extended card");
 }

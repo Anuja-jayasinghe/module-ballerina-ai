@@ -78,6 +78,16 @@ isolated class A2aScriptedAgentExecutor {
             });
             return;
         }
+        if text == "ids" {
+            // Reports the conversation ids the caller sent, so a test can see what the toolkit carried over.
+            string contextId = context.message.contextId ?: "none";
+            string[] refs = context.message.referenceTaskIds ?: [];
+            check updater.addArtifact([
+                {text: string `context=${contextId} refs=${refs.length() == 0 ? "none" : string:'join(",", ...refs)}`}
+            ]);
+            check updater.complete();
+            return;
+        }
         if text == "slow" {
             check updater.working();
             return;
