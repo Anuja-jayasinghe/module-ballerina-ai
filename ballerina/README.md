@@ -258,21 +258,22 @@ Now the `taskManagerTools` instance can be passed to an AI agent, enabling **sta
 
 #### 2.4.3 Calling Another Agent with `ai:A2aToolKit`
 
-An `ai:A2aToolKit` gives an agent tools for one remote [A2A](https://a2a-protocol.org/latest/specification/) agent, the way `ai:McpToolKit` does for one MCP server. It reads the remote agent's Agent Card once, so the tool descriptions say what the remote agent can do. The generated tools send the remote agent a request, continue a task it asked a question about, and get, cancel, and list tasks.
+An `ai:A2aToolKit` gives an agent one remote [A2A](https://a2a-protocol.org/latest/specification/) agent as a single tool, `ask<Name>(request)`, the way Google ADK's `AgentTool` and Microsoft Agent Framework's `AsAIFunction` do. It reads the remote agent's Agent Card once, so the tool description says what the remote agent can do. The model only writes the request; the toolkit handles the A2A protocol.
 
 ```ballerina
-final ai:A2aToolKit tripPlanner = check new ("http://localhost:8000", name = "tripPlanner");
-final ai:A2aToolKit packing = check new ("http://localhost:8003", name = "packing", secret = packingToken);
+final ai:A2aToolKit tripPlanner = check new ("http://localhost:8000");
+final ai:A2aToolKit packing = check new ("http://localhost:8003", secret = packingToken);
 
 ai:Agent concierge = check new (systemPrompt = {role: "Concierge", instructions: "Plan trips."},
     model = model, tools = [tripPlanner, packing]);
 ```
 
-- Every toolkit generates the same operations, so give each its own `name`. The tool names are built from it (`delegateToTripPlanner`, `getTripPlannerTaskStatus`). Use the name of the variable that holds the toolkit. Without a `name`, the name in the Agent Card is used, and two agents with the same card name are rejected when the agent is created.
-- `secret` is the credential for a remote agent whose card declares a security scheme. The card names the scheme the credential is filed under.
-- `toolSet` turns on more tools: streaming, the extended Agent Card, and push notifications.
+- The tool is named after the remote agent's card, such as `askTripPlanner`. Pass `name` to choose the name instead. Two toolkits with the same name are rejected when the agent is created.
+- The toolkit keeps one conversation with the remote agent for each session of the calling agent (the `sessionId` passed to `run`). When the remote agent asks a question, the tool returns it starting with `[INPUT_REQUIRED]`, and the next call in that session answers it, without the model handling task ids. Later requests in the session continue the same A2A conversation.
+- A task that takes longer than the wait is returned as `[WORKING]`, and the next call in that session returns its result. `pollConfig` sets the wait: `pollInterval` is the seconds between reads of the task (0.5 by default) and `maxWait` is the seconds to wait (20 by default).
+- `secret` is the credential for a remote agent whose card declares a security scheme. The card names the scheme the credential is filed under. With a `secret`, the extended Agent Card is read when the card offers one.
+- `requiresApproval` makes calls to the remote agent wait for human approval, always or when a function of the `request` says so.
 - What the remote agent says about itself is untrusted text. The toolkit flattens it to single lines and tells the model that it is the remote agent's own words and not an instruction. The description is capped. The skills are passed in full, and only a single oversized skill is summarized.
-- `pollConfig` sets how `delegateTo<Name>` waits for a task that has not finished: `pollInterval` is the seconds between reads (0.5 by default) and `maxWait` is the seconds to wait before reporting the task as still running (20 by default).
 - Only agents that offer the HTTP+JSON binding can be called.
 
 ### 2.5 Define the Memory
