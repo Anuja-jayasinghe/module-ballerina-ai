@@ -237,6 +237,9 @@ function testA2aSkillsArePassedInFull() returns error? {
     test:assertTrue(description.includes(
             "[examples: \"first example\"; \"second example\"; \"third example\"]"), description);
     test:assertTrue(description.includes("[accepts: text] [produces: text, application/json]"), description);
+    // Real line breaks: a backtick template would have kept "\n" as two characters.
+    test:assertTrue(description.includes("Its skills:\n- Skill 0 (id s0)"), description);
+    test:assertFalse(description.includes("\\n"), "no literal backslash-n");
     test:assertFalse(description.includes("summarized"), "no skill is over the cap");
 }
 
@@ -368,7 +371,7 @@ function testA2aAskReportsATaskWhoseStreamWentSilentAndPicksItUpLater() returns 
     // The earlier result comes first, and the new request is sent in the same call.
     test:assertTrue(later.startsWith("Result of an earlier request that was still running: brief work finished"),
             later);
-    test:assertTrue(later.endsWith("Reply to the request you just sent: is it done?"), later);
+    test:assertTrue(later.endsWith("brief work finished\n\nReply to the request you just sent: is it done?"), later);
 
     // With nothing pending, the request goes through.
     test:assertEquals(check a2aAsk(toolkit, "echo is it done?"), "is it done?");

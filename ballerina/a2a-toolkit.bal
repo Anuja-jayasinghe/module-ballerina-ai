@@ -292,9 +292,9 @@ public isolated class A2aToolKit {
             return reply;
         }
         if reply is error {
-            return string `${earlier}\n\nThe request you just sent failed: ${reply.message()}`;
+            return earlier + "\n\nThe request you just sent failed: " + reply.message();
         }
-        return string `${earlier}\n\nReply to the request you just sent: ${reply}`;
+        return earlier + "\n\nReply to the request you just sent: " + reply;
     }
 
     // Sends the request in the conversation and returns what the model reads.
@@ -672,7 +672,7 @@ isolated function describeAgent(a2a:AgentCard card) returns string {
     if unlisted > 0 {
         entries.push(string `- (${unlisted} more skills not listed)`);
     }
-    return string `${text} Its skills:\n${string:'join("\n", ...entries)}`;
+    return text + " Its skills:\n" + string:'join("\n", ...entries);
 }
 
 // One skill with everything the card says about it: id, description, tags, every example and the input and output
