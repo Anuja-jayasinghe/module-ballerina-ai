@@ -964,16 +964,10 @@ public isolated class A2aToolKit {
     *A2aBaseToolKit;
 
     public isolated function init(a2a:AgentCard|string agent, string? name = (), string? secret = (),
-            http:ClientConfiguration clientConfig = {}, A2aPollConfig pollConfig = {},
-            RequiresApproval requiresApproval = false) returns Error?;
+            http:ClientConfiguration clientConfig = {}, RequiresApproval requiresApproval = false) returns Error?;
 
     public isolated function getTools() returns ToolConfig[];
 }
-
-public type A2aPollConfig record {|
-    decimal pollInterval = 0.5;
-    decimal maxWait = 20;
-|};
 ```
 
 ##### 4.3.4.1. Configuration
@@ -983,8 +977,7 @@ public type A2aPollConfig record {|
 | `agent`            | `a2a:AgentCard\|string`    | Required | The base URL of the remote agent, or an `a2a:AgentCard`. A URL is resolved to the card with `a2a:resolveAgentCard`. A card is used as given and is not fetched again. |
 | `name`             | `string?`                  | `()`     | The name the tool name is built from. `()` means the name in the Agent Card.                                                                                         |
 | `secret`           | `string?`                  | `()`     | The credential for the security scheme the card requires. `()` means no credential is sent.                                                                          |
-| `clientConfig`     | `http:ClientConfiguration` | `{}`     | Used both to fetch the card from a URL and by the client that calls the remote agent.                                                                                |
-| `pollConfig`       | `ai:A2aPollConfig`         | `{}`     | How long the tool waits for a task to settle (`maxWait`, seconds, must not be negative) and how often it reads it (`pollInterval`, seconds, must be positive).        |
+| `clientConfig`     | `http:ClientConfiguration` | `{}`     | Used both to fetch the card from a URL and by the client that calls the remote agent. Its `timeout` is also how long a task's stream may stay silent (4.3.4.5). |
 | `requiresApproval` | `ai:RequiresApproval`      | `false`  | Passed to the tool. `true` pauses every call for human approval; a function receives the proposed `request` and decides per call.                                     |
 
 ##### 4.3.4.2. Initialization
@@ -1050,8 +1043,8 @@ next request starts a new conversation.
 
 ##### 4.3.4.5. Sending a request
 
-1. If the last task of the conversation was still running when it was last seen, the toolkit reads it and waits for
-   it as in step 5, before sending anything. If it has settled, the result is its reply (step 6) followed by a note
+1. If the last task of the conversation was still running when it was last seen, the toolkit reads it once with
+   `getTask` and, if it is still running, follows it with `subscribeToTask` as in step 5, before sending anything. If it has settled, the result is its reply (step 6) followed by a note
    that the new request was not sent, so that the model can send it again. If it is still running, the result is the
    `[WORKING]` reply. If the remote agent no longer knows the task (`a2a:TaskNotFoundError`), the conversation is
    forgotten and the request is sent as in step 2. Any other failure to read it is returned as an error, and the
@@ -1061,18 +1054,23 @@ next request starts a new conversation.
    * If the last task is in `TASK_STATE_INPUT_REQUIRED` or `TASK_STATE_AUTH_REQUIRED`, the message continues that task
      (`taskId`): the request is the answer.
    * Otherwise, if there is a last task, the message starts a new task with `referenceTaskIds` set to the last task.
-   The request asks the remote agent to return without waiting for the task to finish.
+   The message is sent with `sendStreamingMessage`, so a call is one streamed request. When the card does not set
+   `capabilities.streaming`, the client sends one blocking `sendMessage` instead and treats its reply as a stream of
+   one event.
 3. If the remote agent rejects the message with `a2a:TaskNotFoundError` and the message carried the conversation's
    ids, the conversation is forgotten and the request is sent once more as a new conversation.
 4. If the remote agent replies with a message, the result is the text of its parts joined with a space. The
    conversation keeps its `contextId` and has no open task.
-5. If the remote agent replies with a task, the toolkit reads it with `getTask`, immediately and then every
-   `pollInterval` seconds, until it settles or `maxWait` seconds have passed. A `maxWait` of zero returns the task as
-   the remote agent first reported it. A task is settled when its state is `TASK_STATE_COMPLETED`,
-   `TASK_STATE_FAILED`, `TASK_STATE_CANCELED`, `TASK_STATE_REJECTED`, `TASK_STATE_INPUT_REQUIRED`, or
-   `TASK_STATE_AUTH_REQUIRED`. When the message continued a task, the task first returned is the task as it was
-   before the remote agent saw the new message. It is not settled until its state or its status timestamp differs
-   from that snapshot. The polling is not visible to the model.
+5. If the remote agent replies with a task, the toolkit reads the stream: the task, then its status updates and
+   artifact updates, which it applies to the task (an artifact update with `append` adds its parts to the artifact
+   with the same id). It stops reading, and closes the stream, once the task settles. A task is settled when its
+   state is `TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`, `TASK_STATE_CANCELED`, `TASK_STATE_REJECTED`,
+   `TASK_STATE_INPUT_REQUIRED`, or `TASK_STATE_AUTH_REQUIRED`. When the message continued a task, the first task in
+   the stream may be the task as it was before the remote agent saw the new message; the task is not settled until
+   its state or its status timestamp differs from that snapshot. If the stream ends, fails, or stays silent for
+   longer than `clientConfig.timeout` before the task settles, the task is still running on the remote agent: the
+   result is `[WORKING]`, and the conversation records the task as running, so the next call picks it up (step 1).
+   The toolkit never polls.
 6. The result for a task depends on its state. `<text>` is the text of every artifact, one per line; if there is none,
    the text of the status message; if there is neither, a note naming the state.
 
@@ -1082,7 +1080,7 @@ next request starts a new conversation.
    | `TASK_STATE_INPUT_REQUIRED`                                    | `[INPUT_REQUIRED] <text>` and an instruction to call the tool again with the answer             |
    | `TASK_STATE_AUTH_REQUIRED`                                     | `[AUTH_REQUIRED] <text>` and an instruction to tell the user; a warning is logged                |
    | `TASK_STATE_FAILED`, `TASK_STATE_REJECTED`, `TASK_STATE_CANCELED` | `[<state>] <text>`                                                                           |
-   | Any other state, when the wait ran out                         | `[WORKING]` and an instruction to call the tool again later                                     |
+   | Any other state, when the stream ended first                   | `[WORKING]` and an instruction to call the tool again later                                     |
 
 ##### 4.3.4.6. Errors
 
@@ -1092,9 +1090,8 @@ next request starts a new conversation.
 | The card offers no `HTTP+JSON` interface                                          | `ai:Error` from `init`, listing the bindings the card offers         |
 | The card requires several security schemes together                               | `ai:Error` from `init`                                               |
 | `secret` is given and the card declares no security scheme                        | `ai:Error` from `init`                                               |
-| `pollConfig.pollInterval` is not positive, or `pollConfig.maxWait` is negative    | `ai:Error` from `init`                                               |
 | The client cannot be created from the card                                        | `ai:Error` from `init`, with the cause                               |
-| A call to the remote agent fails, for example with an authentication failure      | An `ai:Error` naming the tool, with the `a2a:Error` as its cause, returned from the tool and reported to the model |
+| A call to the remote agent fails before it reports a task, for example with an authentication failure | An `ai:Error` naming the tool, with the `a2a:Error` as its cause, returned from the tool and reported to the model |
 
 ##### 4.3.4.7. Security considerations
 

@@ -23,7 +23,7 @@
 //   "echo <text>"  -> completes immediately with an artifact of <text>
 //   "ask"          -> INPUT_REQUIRED; any follow-up on the same task
 //                     completes with an artifact of the follow-up text
-//   "slow"         -> never settles within a test's poll budget
+//   "slow"         -> WORKING, and never settles
 //   "brief"        -> WORKING for a second, then completes with an artifact
 //   "boom"         -> returns an a2a:Error (FAILED)
 //   anything else  -> a direct a2a:Message reply, not a task at all

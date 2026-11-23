@@ -113,20 +113,6 @@ function testA2aToolKitNamesTheBindingsAnAgentDoesOffer() {
     test:assertTrue(toolkit.message().includes("JSONRPC, GRPC"), toolkit.message());
 }
 
-@test:Config {groups: ["a2a"]}
-function testA2aInvalidPollConfigIsRejected() {
-    A2aToolKit|Error noInterval = new (a2aCard("Bad Poll"), pollConfig = {pollInterval: 0});
-    if noInterval is A2aToolKit {
-        test:assertFail("expected construction to fail: pollInterval must be greater than zero");
-    }
-    test:assertTrue(noInterval.message().includes("pollInterval"), noInterval.message());
-    A2aToolKit|Error negativeWait = new (a2aCard("Bad Poll"), pollConfig = {maxWait: -1});
-    if negativeWait is A2aToolKit {
-        test:assertFail("expected construction to fail: maxWait must not be negative");
-    }
-    test:assertTrue(negativeWait.message().includes("maxWait"), negativeWait.message());
-}
-
 // ---- the one tool ------------------------------------------------------------
 
 @test:Config {groups: ["a2a"]}
@@ -339,9 +325,27 @@ function testA2aAskKeepsSessionsApart() returns error? {
 }
 
 @test:Config {groups: ["a2a"]}
-function testA2aAskReportsAStillRunningTaskAndPicksItUpLater() returns error? {
-    // A wait shorter than the one second "brief" takes, but long enough for an echo.
-    A2aToolKit toolkit = check new (a2aScriptedAgentUrl, pollConfig = {pollInterval: 0.1, maxWait: 0.3});
+function testA2aAskFollowsTheStreamUntilTheTaskFinishes() returns error? {
+    // "brief" works for a second before it completes: one call, one streamed request, the finished answer.
+    A2aToolKit toolkit = check new (a2aScriptedAgentUrl);
+    test:assertEquals(check a2aAsk(toolkit, "brief"), "brief work finished");
+    test:assertEquals(toolkit.conversationOf(DEFAULT_SESSION_ID)?.taskState, a2a:TASK_STATE_COMPLETED);
+}
+
+@test:Config {groups: ["a2a"]}
+function testA2aAskSendsOneBlockingRequestToAnAgentThatCannotStream() returns error? {
+    // The card as the agent serves it (with its interface), but saying it cannot stream.
+    a2a:AgentCard card = (check a2a:resolveAgentCard(a2aScriptedAgentUrl)).clone();
+    card.capabilities.streaming = false;
+    A2aToolKit toolkit = check new (card);
+    test:assertEquals(check a2aAsk(toolkit, "echo no stream needed"), "no stream needed");
+    test:assertEquals(check a2aAsk(toolkit, "brief"), "brief work finished");
+}
+
+@test:Config {groups: ["a2a"]}
+function testA2aAskReportsATaskWhoseStreamWentSilentAndPicksItUpLater() returns error? {
+    // The stream may stay silent no longer than the HTTP timeout; "brief" is silent for a second.
+    A2aToolKit toolkit = check new (a2aScriptedAgentUrl, clientConfig = {timeout: 0.3});
     string first = check a2aAsk(toolkit, "brief");
     test:assertTrue(first.startsWith("[WORKING]"), first);
     test:assertFalse(first.includes("task id"), "the model never sees a task id");
@@ -358,23 +362,11 @@ function testA2aAskReportsAStillRunningTaskAndPicksItUpLater() returns error? {
 }
 
 @test:Config {groups: ["a2a"]}
-function testA2aAskWithNoWaitReturnsTheTaskAsFirstReported() returns error? {
-    A2aToolKit toolkit = check new (a2aScriptedAgentUrl, pollConfig = {maxWait: 0});
-    string reply = check a2aAsk(toolkit, "brief");
-    test:assertTrue(reply.startsWith("[WORKING]"), reply);
-}
-
-@test:Config {groups: ["a2a"]}
-function testA2aAskWaitsForATaskWhileTheWaitAllows() returns error? {
-    A2aToolKit toolkit = check new (a2aScriptedAgentUrl, pollConfig = {pollInterval: 0.1, maxWait: 3});
-    test:assertEquals(check a2aAsk(toolkit, "brief"), "brief work finished");
-}
-
-@test:Config {groups: ["a2a"]}
 function testA2aAskKeepsReportingATaskThatNeverFinishes() returns error? {
-    A2aToolKit toolkit = check new (a2aScriptedAgentUrl, pollConfig = {pollInterval: 0.1, maxWait: 0.3});
+    A2aToolKit toolkit = check new (a2aScriptedAgentUrl, clientConfig = {timeout: 0.3});
     string first = check a2aAsk(toolkit, "slow");
     test:assertTrue(first.startsWith("[WORKING]"), first);
+    // The next call reads the task once and follows its stream again; it is still running.
     string second = check a2aAsk(toolkit, "echo anything new?");
     test:assertTrue(second.startsWith("[WORKING]"), second);
 }

@@ -18,7 +18,6 @@ import ballerina/a2a;
 import ballerina/crypto;
 import ballerina/http;
 import ballerina/lang.regexp;
-import ballerina/lang.runtime;
 import ballerina/log;
 import ballerina/uuid;
 
@@ -34,11 +33,6 @@ const int A2A_MAX_CARD_TEXT_LENGTH = 1024;
 // A skill is passed in full unless its text is longer than this, in which case only that skill is summarized.
 const int A2A_MAX_SKILL_TEXT_LENGTH = 4096;
 
-// Default for how long the tool waits for a task that has not settled, and how often it reads it. See
-// `A2aPollConfig`.
-const decimal A2A_DEFAULT_MAX_WAIT_SECONDS = 20d;
-const decimal A2A_DEFAULT_POLL_INTERVAL_SECONDS = 0.5d;
-
 // How many conversations one toolkit remembers. Past this, the conversation used least recently is forgotten, and
 // its next request starts a new conversation with the remote agent.
 const int A2A_MAX_CONVERSATIONS = 1000;
@@ -49,18 +43,6 @@ public type A2aBaseToolKit distinct isolated object {
     *BaseToolKit;
 };
 
-# Represents how the tool waits for a task that the remote agent has not finished. The toolkit reads the task every
-# `pollInterval` seconds until it settles or `maxWait` seconds have passed, and the model sees one tool call and one
-# result. A task still running when the wait ends is reported as still working, and the next call to the tool picks
-# it up again.
-public type A2aPollConfig record {|
-    # Seconds between two reads of the task. Must be greater than zero
-    decimal pollInterval = A2A_DEFAULT_POLL_INTERVAL_SECONDS;
-    # Seconds to wait for the task to settle. Zero returns the task as the remote agent first reported it, without
-    # reading it again. Must not be negative
-    decimal maxWait = A2A_DEFAULT_MAX_WAIT_SECONDS;
-|};
-
 // Where one conversation with the remote agent stands: the A2A context it runs in, and the last task in it with the
 // state that task was last seen in.
 type A2aConversation record {|
@@ -69,13 +51,21 @@ type A2aConversation record {|
     a2a:TaskState taskState?;
 |};
 
+// A task as read from the remote agent's stream, and whether it settled before the stream ended. A task that did not
+// settle is still running on the remote agent: the stream was cut, timed out, or ended early.
+type A2aOutcome record {|
+    a2a:Task task;
+    boolean settled;
+|};
+
 # Represents a toolkit that gives an agent one remote [A2A](https://a2a-protocol.org/latest/specification/) agent as
 # a single tool, `ask<Name>(request)`, the way Google ADK's `AgentTool` and Microsoft Agent Framework's
 # `AsAIFunction` do.
 #
 # The model only writes the request. Everything else is the toolkit's job: it keeps one conversation with the remote
-# agent per session of the calling agent, continues a task the remote agent asked a question about, waits for a task
-# that takes a while, and reports a task still running when the wait ends so that a later call can pick it up.
+# agent per session of the calling agent, continues a task the remote agent asked a question about, and waits for a
+# task to finish by following the remote agent's stream of updates, so one call is one streamed request. If the
+# stream ends before the task does, the task is reported as still running and the next call picks it up.
 #
 # One instance wraps one remote agent. Add one instance per remote agent to the `tools` of an agent.
 #
@@ -91,8 +81,6 @@ public isolated class A2aToolKit {
     private final a2a:RestClient agentClient;
     private final ToolConfig[] & readonly tools;
     private final string toolName;
-    private final decimal pollInterval;
-    private final decimal maxWait;
     private final map<A2aConversation & readonly> conversations = {};
     // Session ids, least recently used first, to forget the oldest conversation once there are too many.
     private final string[] sessionOrder = [];
@@ -111,16 +99,15 @@ public isolated class A2aToolKit {
     # + secret - Credential for a remote agent whose card declares a security scheme. The card names the scheme the
     #            credential is filed under, so only the credential is given
     # + clientConfig - Configuration for fetching the card and for the client, such as `httpVersion`, `timeout`, and
-    #                  TLS settings
-    # + pollConfig - How long the tool waits for a task to settle, and how often it reads the task
+    #                  TLS settings. `timeout` is also how long a task's stream may stay silent; a task that is silent
+    #                  for longer is reported as still running and picked up by the next call
     # + requiresApproval - Whether a call to the tool needs human approval first. A function gets the proposed
     #                      `request` and decides per call
     # + return - An `ai:Error` if the Agent Card cannot be read, if the remote agent offers no HTTP+JSON interface, if
     #            the card requires several security schemes together, if `secret` is given and the card declares no
-    #            security scheme, or if `pollConfig` has a non-positive `pollInterval` or a negative `maxWait`
+    #            security scheme
     public isolated function init(a2a:AgentCard|string agent, string? name = (), string? secret = (),
-            http:ClientConfiguration clientConfig = {}, A2aPollConfig pollConfig = {},
-            RequiresApproval requiresApproval = false) returns Error? {
+            http:ClientConfiguration clientConfig = {}, RequiresApproval requiresApproval = false) returns Error? {
         a2a:AgentCard card;
         if agent is a2a:AgentCard {
             card = agent;
@@ -139,9 +126,6 @@ public isolated class A2aToolKit {
         string displayName = singleLine(name ?: card.name, A2A_MAX_NAME_PART_LENGTH * 2);
         string? schemeName = check schemeFor(card, displayName, secret);
         check requireHttpJson(card, displayName);
-        check requireValidPollConfig(displayName, pollConfig);
-        self.pollInterval = pollConfig.pollInterval;
-        self.maxWait = pollConfig.maxWait;
 
         a2a:RestClient|error agentClient = connect(card, schemeName, secret, clientConfig);
         if agentClient is error {
@@ -212,10 +196,12 @@ public isolated class A2aToolKit {
                     + pending.message(), pending);
             }
             if pending is a2a:Task {
-                a2a:Task settled = check self.pollUntilSettled(pending);
-                self.remember(session, settled);
-                string reply = self.replyFor(settled);
-                return isSettled(settled.status.state)
+                A2aOutcome outcome = isSettled(pending.status.state)
+                    ? {task: pending, settled: true}
+                    : self.follow(pending);
+                self.remember(session, outcome);
+                string reply = self.replyFor(outcome);
+                return outcome.settled
                     ? reply + " (This is the result of an earlier request that was still running. The request "
                         + "you just sent was not delivered; send it again if it is still needed.)"
                     : reply;
@@ -247,9 +233,10 @@ public isolated class A2aToolKit {
             }
         }
 
-        a2a:Task|a2a:Message|a2a:Error result = self.agentClient->sendMessage({
-            message: outbound,
-            configuration: {returnImmediately: true}
+        // One streamed request, like the other A2A frameworks. When the card says the agent cannot stream, the client
+        // sends one blocking request instead and hands back its reply as a one-event stream.
+        stream<a2a:StreamResponse, a2a:Error?>|a2a:Error result = self.agentClient->sendStreamingMessage({
+            message: outbound
         });
         if result is a2a:TaskNotFoundError && (continuation || contextId is string) {
             // The remote agent no longer knows the conversation. Its task was rejected, so nothing ran, and the
@@ -257,37 +244,38 @@ public isolated class A2aToolKit {
             log:printWarn("The remote agent no longer knows this conversation; starting a new one",
                     tool = self.toolName);
             self.forget(session);
-            result = self.agentClient->sendMessage({
-                message: {messageId: uuid:createType4AsString(), role: a2a:ROLE_USER, parts: [{text: request}]},
-                configuration: {returnImmediately: true}
+            result = self.agentClient->sendStreamingMessage({
+                message: {messageId: uuid:createType4AsString(), role: a2a:ROLE_USER, parts: [{text: request}]}
             });
             continuation = false;
         }
         if result is a2a:Error {
             return error Error(string `agent call "${self.toolName}" failed: ${result.message()}`, result);
         }
-        if result is a2a:Message {
-            // A direct reply ends whatever task this conversation had, but keeps its context.
-            string? replyContextId = result?.contextId ?: contextId;
-            self.store(session, replyContextId is string ? {contextId: replyContextId} : {});
-            return partsText(result.parts);
+        A2aOutcome|a2a:Message|a2a:Error outcome = self.read(result, continuation);
+        if outcome is a2a:Error {
+            return error Error(string `agent call "${self.toolName}" failed: ${outcome.message()}`, outcome);
         }
-        // `returnImmediately` hands back a Task as soon as it exists, so a fast agent would otherwise always look
-        // unfinished. Task and Message are both open records, so the compiler cannot narrow `result` after the
-        // check above.
-        //
-        // For a continuation the Task that comes back is the one as it stood BEFORE the new message: still
-        // INPUT_REQUIRED, with the question asked last time. Treating that as settled hands the model the old
-        // question while the agent is already working on the answer. A continuation is only judged once the task has
-        // moved on from that snapshot.
-        a2a:Task settled = check self.pollUntilSettled(<a2a:Task>result, continuation);
-        self.remember(session, settled);
-        return self.replyFor(settled);
+        if outcome is A2aOutcome {
+            self.remember(session, outcome);
+            return self.replyFor(outcome);
+        }
+        // A direct reply ends whatever task this conversation had, but keeps its context. Both arms are open records,
+        // so the compiler cannot narrow `outcome` after the check above.
+        a2a:Message reply = <a2a:Message>outcome;
+        string? replyContextId = reply?.contextId ?: contextId;
+        self.store(session, replyContextId is string ? {contextId: replyContextId} : {});
+        return partsText(reply.parts);
     }
 
     // What the model reads for a task. A finished task is its answer alone; every other state is named, with what
     // to do next, because the model cannot see the task.
-    private isolated function replyFor(a2a:Task task) returns string {
+    private isolated function replyFor(A2aOutcome outcome) returns string {
+        a2a:Task task = outcome.task;
+        if !outcome.settled {
+            return string `[WORKING] The agent is still working on this request. Call ${self.toolName} again later, `
+                + string `for example when the user asks about it, to get the result.`;
+        }
         string text = taskText(task);
         match task.status.state {
             a2a:TASK_STATE_COMPLETED => {
@@ -312,28 +300,82 @@ public isolated class A2aToolKit {
             + string `for example when the user asks about it, to get the result.`;
     }
 
-    # Polls a task until it settles or the wait runs out.
+    # Reads a task's stream of updates until the task settles or the stream ends.
     #
-    # + initial - The task as the remote agent first reported it
-    # + continuation - Whether `initial` is the snapshot of a task that existed before this call. Such a task is not
-    #                  settled just because it still shows the state it was in, because that state is from before
-    #                  the agent saw the new message
-    # + return - The task once it settled, or as it stood when the wait ran out, or an error if the task cannot be read
-    private isolated function pollUntilSettled(a2a:Task initial, boolean continuation = false)
-            returns a2a:Task|error {
-        a2a:Task task = initial;
-        decimal elapsed = 0d;
-        boolean first = true;
-        while (!isSettled(task.status.state) || (continuation && unchangedSince(initial, task)))
-                && elapsed < self.maxWait {
-            if !first {
-                runtime:sleep(self.pollInterval);
-                elapsed += self.pollInterval;
+    # + events - The stream from sending the message, or from subscribing to a task
+    # + continuation - Whether this stream answers a task that was waiting on the caller. Such a stream may start
+    #                  with the task as it stood BEFORE the answer: still INPUT_REQUIRED, with the question asked last
+    #                  time. Treating that as settled would hand the model the old question while the agent is
+    #                  already working on the answer, so the task only counts as settled once it has moved on from
+    #                  that first snapshot
+    # + return - A direct `a2a:Message` reply; the task, and whether it settled before the stream ended; or an error
+    #            if the stream failed before the agent reported any task
+    private isolated function read(stream<a2a:StreamResponse, a2a:Error?> events, boolean continuation = false)
+            returns A2aOutcome|a2a:Message|a2a:Error {
+        a2a:Task? task = ();
+        a2a:Task? before = ();
+        while true {
+            record {|a2a:StreamResponse value;|}|a2a:Error? next = events.next();
+            if next is () {
+                break;
             }
-            first = false;
-            task = check self.agentClient->getTask({id: task.id});
+            if next is a2a:Error {
+                if task is () {
+                    return next;
+                }
+                // The task exists and may still be running; the next call picks it up.
+                log:printWarn("The remote agent's stream failed before the task settled", tool = self.toolName,
+                        taskId = task.id, 'error = next);
+                return {task, settled: false};
+            }
+            a2a:StreamResponse event = next.value;
+            if event is a2a:Message && task is () {
+                error? closed = events.close();
+                if closed is error {
+                    log:printDebug("Could not close the remote agent's stream", 'error = closed);
+                }
+                return event;
+            }
+            task = applyEvent(task, event);
+            if continuation && before is () && event is a2a:Task {
+                before = event.clone();
+            }
+            a2a:Task current = <a2a:Task>task;
+            a2a:Task? snapshot = before;
+            boolean stale = snapshot is a2a:Task && unchangedSince(snapshot, current);
+            if isSettled(current.status.state) && !stale {
+                error? closed = events.close();
+                if closed is error {
+                    log:printDebug("Could not close the remote agent's stream", 'error = closed);
+                }
+                return {task: current, settled: true};
+            }
         }
-        return task;
+        if task is () {
+            return error a2a:InternalError("the remote agent's stream ended without reporting a task");
+        }
+        // The stream ended first: an agent that ends its stream once the task waits on the caller, or one that hung
+        // up. A task still showing the snapshot it had before this call has not been seen to move on.
+        a2a:Task? snapshot = before;
+        boolean stale = snapshot is a2a:Task && unchangedSince(snapshot, task);
+        return {task, settled: isSettled(task.status.state) && !stale};
+    }
+
+    # Follows a task that an earlier call left running, through the remote agent's task stream.
+    #
+    # + task - The task as just read
+    # + return - The task, and whether it settled; a task that cannot be followed is reported as not settled
+    private isolated function follow(a2a:Task task) returns A2aOutcome {
+        stream<a2a:StreamResponse, a2a:Error?>|a2a:Error events = self.agentClient->subscribeToTask({id: task.id});
+        if events is a2a:Error {
+            // For example an agent that cannot stream: the task is reported as still running, and read again on the
+            // next call.
+            log:printDebug("Could not follow the remote agent's task", tool = self.toolName, taskId = task.id,
+                    'error = events);
+            return {task, settled: false};
+        }
+        A2aOutcome|a2a:Message|a2a:Error outcome = self.read(events);
+        return outcome is A2aOutcome ? outcome : {task, settled: false};
     }
 
     // Module-visible, not private, so the tests can read and set where a conversation stands.
@@ -343,10 +385,13 @@ public isolated class A2aToolKit {
         }
     }
 
-    // Records where the conversation stands after a task was seen.
-    private isolated function remember(string session, a2a:Task task) {
+    // Records where the conversation stands after a task was seen. A task that did not settle is recorded as working,
+    // whatever its last state, so the next call reads it before sending anything.
+    private isolated function remember(string session, A2aOutcome outcome) {
+        a2a:Task task = outcome.task;
         string? contextId = task?.contextId ?: self.conversationOf(session)?.contextId;
-        A2aConversation conversation = {taskId: task.id, taskState: task.status.state};
+        A2aConversation conversation = {taskId: task.id,
+            taskState: outcome.settled ? task.status.state : a2a:TASK_STATE_WORKING};
         if contextId is string {
             conversation.contextId = contextId;
         }
@@ -378,17 +423,6 @@ public isolated class A2aToolKit {
     }
 }
 
-isolated function requireValidPollConfig(string displayName, A2aPollConfig pollConfig) returns Error? {
-    if pollConfig.pollInterval <= 0d {
-        return error Error(string `agent "${displayName}": pollInterval must be greater than zero, `
-            + string `got ${pollConfig.pollInterval}`);
-    }
-    if pollConfig.maxWait < 0d {
-        return error Error(string `agent "${displayName}": maxWait must not be negative, got ${pollConfig.maxWait}`);
-    }
-}
-
-// The card names the scheme the secret is filed under, so the secret is the only thing supplied.
 isolated function schemeFor(a2a:AgentCard card, string displayName, string? secret) returns string?|Error {
     string? schemeName = ();
     a2a:SecurityRequirement[]? securityRequirements = card.securityRequirements;
@@ -529,12 +563,49 @@ isolated function singleLine(string text, int maxLength) returns string {
 isolated function unchangedSince(a2a:Task before, a2a:Task now) returns boolean =>
     before.status.state == now.status.state && before.status?.timestamp == now.status?.timestamp;
 
-// AUTH_REQUIRED and INPUT_REQUIRED count as settled: both mean the agent is waiting on the caller, so polling
-// further would only use up the wait.
+// AUTH_REQUIRED and INPUT_REQUIRED count as settled: both mean the agent is waiting on the caller, so there is
+// nothing more to wait for.
 isolated function isSettled(a2a:TaskState state) returns boolean =>
     state == a2a:TASK_STATE_COMPLETED || state == a2a:TASK_STATE_FAILED
     || state == a2a:TASK_STATE_CANCELED || state == a2a:TASK_STATE_REJECTED
     || state == a2a:TASK_STATE_INPUT_REQUIRED || state == a2a:TASK_STATE_AUTH_REQUIRED;
+
+// Folds one stream event into the task as known so far. The first event is normally the task itself; a status or
+// artifact update that comes first starts a task from its ids.
+isolated function applyEvent(a2a:Task? known, a2a:StreamResponse event) returns a2a:Task? {
+    if event is a2a:TaskArtifactUpdateEvent {
+        a2a:Task task = known ?: {id: event.taskId, contextId: event.contextId, status: {state: a2a:TASK_STATE_WORKING}};
+        a2a:Artifact[] artifacts = [...(task.artifacts ?: [])];
+        a2a:Artifact update = event.artifact;
+        int? at = ();
+        foreach int i in 0 ..< artifacts.length() {
+            if artifacts[i].artifactId == update.artifactId {
+                at = i;
+            }
+        }
+        if at is int && event.append {
+            a2a:Artifact merged = artifacts[at].clone();
+            merged.parts = [...merged.parts, ...update.parts];
+            artifacts[at] = merged;
+        } else if at is int {
+            artifacts[at] = update;
+        } else {
+            artifacts.push(update);
+        }
+        task.artifacts = artifacts;
+        return task;
+    }
+    if event is a2a:TaskStatusUpdateEvent {
+        a2a:Task task = known ?: {id: event.taskId, contextId: event.contextId, status: event.status};
+        task.status = event.status;
+        return task;
+    }
+    if event is a2a:Task {
+        return event.clone();
+    }
+    // A message in the middle of a task carries no state of its own.
+    return known;
+}
 
 isolated function partsText(a2a:Part[] parts) returns string {
     string[] texts = [];
