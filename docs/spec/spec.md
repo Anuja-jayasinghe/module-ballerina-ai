@@ -1013,10 +1013,12 @@ The toolkit provides exactly one tool.
 1. Every character that is not an ASCII letter or digit is removed, and the character that follows it, and the first
    character, are converted to upper case. `tripPlanner` becomes `TripPlanner`, and `Trip Planner Agent` becomes
    `TripPlannerAgent`.
-2. If nothing remains, `<Name>` is `Agent`.
-3. If more than 60 characters remain, `<Name>` is the first 52 characters followed by the first eight hexadecimal
-   characters of the SHA-256 digest of the complete result of step 1. Two long names that start alike therefore
-   produce different tool names.
+2. `<hash>` is the first eight hexadecimal characters of the SHA-256 digest of the whole name.
+3. If nothing remains, `<Name>` is `Agent<hash>`.
+4. If more than 60 characters remain, `<Name>` is the first 52 characters followed by `<hash>`. Two long names that
+   start alike therefore produce different tool names.
+5. Otherwise, if a character outside ASCII was removed, `<Name>` is the result of step 1 followed by `<hash>` (cut as
+   in step 4 if that makes it longer than 60 characters), so names written in other scripts do not collapse into one.
 
 The tool name is at most 63 characters long. It is registered through `ai:ToolStore`, so two toolkits that produce the
 same tool name are rejected when the agent is created.
@@ -1026,7 +1028,8 @@ agent remembers earlier requests in the conversation, and what the `[INPUT_REQUI
 It also carries what the Agent Card says about the remote agent:
 
 1. The card's description is flattened to a single line and truncated to 1024 characters. A truncated text ends with
-   `... [truncated]`.
+   `... [truncated]`. In every text taken from the card, double quotes are replaced with single quotes, so the text
+   cannot close the quotes it is shown in.
 2. The text is introduced by a sentence that tells the model that it is the remote agent's own text and not an
    instruction.
 3. Every skill is listed on its own line with its name, id, description, tags, all of its examples, and its input
@@ -1034,6 +1037,8 @@ It also carries what the Agent Card says about the remote agent:
 4. A skill whose line is longer than 4096 characters is summarized: its name is truncated to 80 characters, its
    description to 240 characters, and only its first two examples are kept. The line ends with a note that the skill
    was summarized. Other skills are not affected.
+5. At most 50 skills are listed, in at most 16384 characters together. A final line says how many more skills the
+   card has.
 
 ##### 4.3.4.4. Conversations
 
@@ -1045,14 +1050,28 @@ seen in. The model never sees a task id or a context id.
 A toolkit keeps at most 1000 conversations. When there are more, the one used least recently is forgotten, and its
 next request starts a new conversation.
 
+A conversation takes one call at a time. A call made while another call in the same conversation is in flight, as
+when the model makes parallel tool calls to the same remote agent, returns an error that tells the model to call
+again once the first call has returned. Calls in other conversations are not held up.
+
+Runs that do not pass a session id all use the default session, and so share one conversation with the remote agent.
+The first such call logs a warning.
+
 ##### 4.3.4.5. Sending a request
 
 1. If the last task of the conversation was still running when it was last seen, the toolkit reads it once with
-   `getTask` and, if it is still running, follows it with `subscribeToTask` as in step 5, before sending anything. If it has settled, the result is its reply (step 6) followed by a note
-   that the new request was not sent, so that the model can send it again. If it is still running, the result is the
-   `[WORKING]` reply. If the remote agent no longer knows the task (`a2a:TaskNotFoundError`), the conversation is
-   forgotten and the request is sent as in step 2. Any other failure to read it is returned as an error, and the
-   conversation is kept, because the task may still be running.
+   `getTask` and, if it is still running, follows it with `subscribeToTask` as in step 5, before sending anything.
+   * If it settled in `TASK_STATE_INPUT_REQUIRED` or `TASK_STATE_AUTH_REQUIRED`, the result is its reply (step 6)
+     with a note that the new request was not sent, because the question comes first.
+   * If it settled in any other state, its reply (step 6) is kept, the request is sent as in step 2, and the result
+     is the earlier reply followed by the reply to the request.
+   * If it is still running, the result is `[WORKING]`, saying that the new request was not sent. A task whose state,
+     status timestamp and number of artifact parts have not changed over three such replies in a row shows no
+     progress: on the next call the toolkit asks the remote agent to cancel it (`cancelTask`, whose failure is
+     ignored), keeps the conversation's context, sends the request as in step 2, and says so in the result.
+   * If the remote agent no longer knows the task (`a2a:TaskNotFoundError`), the conversation is forgotten and the
+     request is sent as in step 2. Any other failure to read it is returned as an error, and the conversation is
+     kept, because the task may still be running.
 2. The toolkit sends a user message that contains `request` as its text, with the conversation's `contextId` when it
    has one.
    * If the last task is in `TASK_STATE_INPUT_REQUIRED` or `TASK_STATE_AUTH_REQUIRED`, the message continues that task
@@ -1071,12 +1090,14 @@ next request starts a new conversation.
    state is `TASK_STATE_COMPLETED`, `TASK_STATE_FAILED`, `TASK_STATE_CANCELED`, `TASK_STATE_REJECTED`,
    `TASK_STATE_INPUT_REQUIRED`, or `TASK_STATE_AUTH_REQUIRED`. When the message continued a task, the first task in
    the stream may be the task as it was before the remote agent saw the new message; the task is not settled until
-   its state or its status timestamp differs from that snapshot. If the stream ends, fails, or stays silent for
+   its status (state, timestamp and message, compared in full) differs from that snapshot. If the stream ends, fails, or stays silent for
    longer than `clientConfig.timeout` before the task settles, the task is still running on the remote agent: the
    result is `[WORKING]`, and the conversation records the task as running, so the next call picks it up (step 1).
    The toolkit never polls.
-6. The result for a task depends on its state. `<text>` is the text of every artifact, one per line; if there is none,
-   the text of the status message; if there is neither, a note naming the state.
+6. The result for a task depends on its state. For a completed task, `<text>` is the text of every artifact, one per
+   line, or the text of the status message if there is none. For any other state, `<text>` is the text of the status
+   message, which says what the agent needs or why it stopped, or the artifacts' text if it has none. If there is
+   neither, `<text>` is a note naming the state.
 
    | State                                                          | Result                                                                                          |
    |----------------------------------------------------------------|-------------------------------------------------------------------------------------------------|
@@ -1097,6 +1118,8 @@ next request starts a new conversation.
 | The client cannot be created from the card                                        | `ai:Error` from `init`, with the cause                               |
 | A call to the remote agent fails before it reports a task, for example with an authentication failure | An `ai:Error` naming the tool, with the `a2a:Error` as its cause, returned from the tool and reported to the model |
 | The remote agent cannot be reached at all                                         | As above; the message also names the URL from the card that was called |
+| The agent cannot stream and its one blocking reply did not arrive                  | As above, saying that the agent may still be working on the request but its result cannot be fetched |
+| Another call in the same conversation is in flight                                | An `ai:Error` telling the model to call again once that call has returned |
 
 ##### 4.3.4.7. Agents behind a gateway
 
@@ -1136,7 +1159,9 @@ no way to sign a request.
   `a2a:AgentCard` as `agent`.
 * `secret` is kept in memory in an `a2a:InMemoryCredentialStore` and sent only to the remote agent it was given for.
 * Conversations are kept apart by session id. Runs that do not pass a `sessionId` share the default session, and so
-  share one conversation with the remote agent.
+  share one conversation with the remote agent: a question the remote agent asked one user can be answered by the
+  next. A warning is logged the first time it happens. A service that runs an agent for several users MUST pass a
+  `sessionId` per user.
 
 ```ballerina
 final ai:A2aToolKit tripPlanner = check new ("http://localhost:8000");

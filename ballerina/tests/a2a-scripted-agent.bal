@@ -23,6 +23,7 @@
 //   "echo <text>"  -> completes immediately with an artifact of <text>
 //   "ask"          -> INPUT_REQUIRED; any follow-up on the same task
 //                     completes with an artifact of the follow-up text
+//   "draft"        -> an artifact, then INPUT_REQUIRED asking "which format?"
 //   "slow"         -> WORKING, and never settles
 //   "brief"        -> WORKING for a second, then completes with an artifact
 //   "boom"         -> returns an a2a:Error (FAILED)
@@ -86,6 +87,16 @@ isolated class A2aScriptedAgentExecutor {
                 {text: string `context=${contextId} refs=${refs.length() == 0 ? "none" : string:'join(",", ...refs)}`}
             ]);
             check updater.complete();
+            return;
+        }
+        if text == "draft" {
+            // An artifact first, then a question: the question is what the caller needs to see.
+            check updater.addArtifact([{text: "a partial draft"}]);
+            check updater.requireInput({
+                messageId: "scripted-draft",
+                role: a2a:ROLE_AGENT,
+                parts: [{text: "which format?"}]
+            });
             return;
         }
         if text == "slow" {

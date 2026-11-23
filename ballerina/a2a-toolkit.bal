@@ -36,6 +36,14 @@ const int A2A_MAX_SKILL_TEXT_LENGTH = 4096;
 // Where an agent serves its Agent Card, relative to its base URL.
 const string A2A_CARD_PATH = "/.well-known/agent-card.json";
 
+// A task that shows no progress gets at most this many [WORKING] replies in a row. On the next call the toolkit stops
+// waiting for it, asks the remote agent to cancel it, and sends the new request.
+const int A2A_MAX_STALLED_REPLIES = 3;
+
+// The tool description lists at most this many skills, in at most this many characters.
+const int A2A_MAX_SKILLS = 50;
+const int A2A_MAX_SKILLS_TEXT_LENGTH = 16384;
+
 // How many conversations one toolkit remembers. Past this, the conversation used least recently is forgotten, and
 // its next request starts a new conversation with the remote agent.
 const int A2A_MAX_CONVERSATIONS = 1000;
@@ -52,6 +60,10 @@ type A2aConversation record {|
     string contextId?;
     string taskId?;
     a2a:TaskState taskState?;
+    // For a task still running: how many [WORKING] replies in a row found it showing no progress, and what it
+    // looked like the last time.
+    int stalledReplies?;
+    string progress?;
 |};
 
 // A task as read from the remote agent's stream, and whether it settled before the stream ended. A task that did not
@@ -87,7 +99,12 @@ public isolated class A2aToolKit {
     // Where the card says calls go. Named in transport failures: behind a gateway, a card that still lists the
     // agent's internal address is the usual cause.
     private final string agentUrl;
+    // Whether the card says the agent can stream. When it cannot, a call is one blocking request.
+    private final boolean streams;
     private final map<A2aConversation & readonly> conversations = {};
+    // Sessions with a call in flight. One call at a time per conversation.
+    private final map<boolean> busy = {};
+    private boolean warnedSharedSession = false;
     // Session ids, least recently used first, to forget the oldest conversation once there are too many.
     private final string[] sessionOrder = [];
 
@@ -140,6 +157,7 @@ public isolated class A2aToolKit {
         string displayName = singleLine(name ?: card.name, A2A_MAX_NAME_PART_LENGTH * 2);
         string? schemeName = check schemeFor(card, displayName, secret);
         self.agentUrl = check requireHttpJson(card, displayName);
+        self.streams = card.capabilities.streaming == true;
 
         a2a:RestClient|error agentClient = connect(card, schemeName, secret, clientConfig, headers);
         if agentClient is error {
@@ -195,10 +213,26 @@ public isolated class A2aToolKit {
     // The tool. `context` is supplied by the agent, so the model only writes `request`.
     private isolated function ask(Context context, string request) returns string|error {
         string session = context.getSessionId() ?: DEFAULT_SESSION_ID;
+        if session == DEFAULT_SESSION_ID {
+            self.warnSharedSession();
+        }
+        // Two calls in flight in one conversation would both read where it stands and both overwrite it, so a second
+        // call waits for its turn through the model instead. An agent runs parallel tool calls by default.
+        if !self.claim(session) {
+            return error Error(string `another request to this agent is still running in this conversation; call `
+                + string `${self.toolName} with this request again once that one has returned`);
+        }
+        string|error reply = self.askInSession(session, request);
+        self.release(session);
+        return reply;
+    }
+
+    private isolated function askInSession(string session, string request) returns string|error {
         A2aConversation conversation = self.conversationOf(session);
 
         // A task left running by an earlier call is finished first. Sending the new request now would start a
         // second task, and the earlier result would never reach the model.
+        string earlier = "";
         string? pendingTaskId = conversation?.taskId;
         a2a:TaskState? pendingState = conversation?.taskState;
         if pendingTaskId is string && pendingState is a2a:TaskState && !isSettled(pendingState) {
@@ -213,21 +247,58 @@ public isolated class A2aToolKit {
                 A2aOutcome outcome = isSettled(pending.status.state)
                     ? {task: pending, settled: true}
                     : self.follow(pending);
-                self.remember(session, outcome);
-                string reply = self.replyFor(outcome);
-                return outcome.settled
-                    ? reply + " (This is the result of an earlier request that was still running. The request "
-                        + "you just sent was not delivered; send it again if it is still needed.)"
-                    : reply;
+                if !outcome.settled {
+                    int stalled = conversation?.progress == progressOf(outcome.task)
+                        ? (conversation?.stalledReplies ?: 0) + 1
+                        : 1;
+                    if stalled <= A2A_MAX_STALLED_REPLIES {
+                        self.remember(session, outcome, stalled);
+                        return string `[WORKING] The agent is still working on an earlier request, so the request `
+                            + string `you just sent was not delivered. Call ${self.toolName} again later, for `
+                            + string `example when the user asks about it, to get the earlier result, and send this `
+                            + string `request again then.`;
+                    }
+                    // Still running and showing no progress: stop waiting for it, and send the new request.
+                    self.abandon(outcome.task);
+                    string? keptContext = outcome.task?.contextId ?: conversation?.contextId;
+                    conversation = keptContext is string ? {contextId: keptContext} : {};
+                    self.store(session, conversation);
+                    earlier = string `An earlier request showed no progress after ${A2A_MAX_STALLED_REPLIES} `
+                        + string `checks, so it was cancelled.`;
+                } else {
+                    self.remember(session, outcome);
+                    a2a:TaskState state = outcome.task.status.state;
+                    if state == a2a:TASK_STATE_INPUT_REQUIRED || state == a2a:TASK_STATE_AUTH_REQUIRED {
+                        // The question has to be answered before anything else is sent in this conversation.
+                        return self.replyFor(outcome) + " (This comes from an earlier request that was still "
+                            + "running. The request you just sent was not delivered: deal with this first, then "
+                            + "send that request again if it is still needed.)";
+                    }
+                    earlier = "Result of an earlier request that was still running: " + self.replyFor(outcome);
+                    conversation = self.conversationOf(session);
+                }
+            } else {
+                // The remote agent no longer knows the task, for example because it restarted. Nothing can be read
+                // from it, so the conversation starts over.
+                log:printWarn("A task left running on the remote agent can no longer be read; starting over",
+                        tool = self.toolName, taskId = pendingTaskId);
+                self.forget(session);
+                conversation = {};
             }
-            // The remote agent no longer knows the task, for example because it restarted. Nothing can be read
-            // from it, so the conversation starts over.
-            log:printWarn("A task left running on the remote agent can no longer be read; starting over",
-                    tool = self.toolName, taskId = pendingTaskId);
-            self.forget(session);
-            conversation = {};
         }
 
+        string|error reply = self.send(session, conversation, request);
+        if earlier == "" {
+            return reply;
+        }
+        if reply is error {
+            return string `${earlier}\n\nThe request you just sent failed: ${reply.message()}`;
+        }
+        return string `${earlier}\n\nReply to the request you just sent: ${reply}`;
+    }
+
+    // Sends the request in the conversation and returns what the model reads.
+    private isolated function send(string session, A2aConversation conversation, string request) returns string|error {
         a2a:Message outbound = {messageId: uuid:createType4AsString(), role: a2a:ROLE_USER, parts: [{text: request}]};
         string? contextId = conversation?.contextId;
         if contextId is string {
@@ -264,11 +335,11 @@ public isolated class A2aToolKit {
             continuation = false;
         }
         if result is a2a:Error {
-            return error Error(string `agent call "${self.toolName}" failed: ${self.describe(result)}`, result);
+            return self.failed(result);
         }
         A2aOutcome|a2a:Message|a2a:Error outcome = self.read(result, continuation);
         if outcome is a2a:Error {
-            return error Error(string `agent call "${self.toolName}" failed: ${self.describe(outcome)}`, outcome);
+            return self.failed(outcome);
         }
         if outcome is A2aOutcome {
             self.remember(session, outcome);
@@ -284,9 +355,56 @@ public isolated class A2aToolKit {
 
     // An error's message, with the address that was called when the agent could not be reached at all.
     private isolated function describe(a2a:Error err) returns string =>
-        err is a2a:InternalError && err.message().startsWith("Transport-level failure")
+        isTransportFailure(err)
             ? string `${err.message()} (calling ${self.agentUrl}, the address in the agent's card)`
             : err.message();
+
+    // A failed send. When the agent cannot stream, the call was one blocking request: if no reply came back, the agent
+    // may still be working on it, but no task id was received, so its result cannot be fetched later.
+    private isolated function failed(a2a:Error err) returns Error {
+        if !self.streams && isTransportFailure(err) {
+            return error Error(string `agent call "${self.toolName}" got no reply: ${self.describe(err)}. This `
+                + string `agent cannot stream, so the call waited for one reply. The agent may still be working on `
+                + string `the request, but its result cannot be fetched; sending the request again starts it over.`,
+                err);
+        }
+        return error Error(string `agent call "${self.toolName}" failed: ${self.describe(err)}`, err);
+    }
+
+    // Asks the remote agent to cancel a task the toolkit stopped waiting for. The new request is sent either way.
+    private isolated function abandon(a2a:Task task) {
+        a2a:Task|a2a:Error cancelled = self.agentClient->cancelTask({id: task.id});
+        log:printWarn("Stopped waiting for a remote task that showed no progress", tool = self.toolName,
+                taskId = task.id, cancelled = cancelled is a2a:Task);
+    }
+
+    private isolated function claim(string session) returns boolean {
+        lock {
+            if self.busy.hasKey(session) {
+                return false;
+            }
+            self.busy[session] = true;
+            return true;
+        }
+    }
+
+    private isolated function release(string session) {
+        lock {
+            _ = self.busy.removeIfHasKey(session);
+        }
+    }
+
+    // Runs without a session id share one conversation with the remote agent, whoever started them.
+    private isolated function warnSharedSession() {
+        lock {
+            if self.warnedSharedSession {
+                return;
+            }
+            self.warnedSharedSession = true;
+        }
+        log:printWarn("Agent runs without a session id share one conversation with the remote agent; pass a "
+                + "sessionId for each user to keep them apart", tool = self.toolName);
+    }
 
     // What the model reads for a task. A finished task is its answer alone; every other state is named, with what
     // to do next, because the model cannot see the task.
@@ -407,11 +525,15 @@ public isolated class A2aToolKit {
 
     // Records where the conversation stands after a task was seen. A task that did not settle is recorded as working,
     // whatever its last state, so the next call reads it before sending anything.
-    private isolated function remember(string session, A2aOutcome outcome) {
+    private isolated function remember(string session, A2aOutcome outcome, int stalledReplies = 1) {
         a2a:Task task = outcome.task;
         string? contextId = task?.contextId ?: self.conversationOf(session)?.contextId;
         A2aConversation conversation = {taskId: task.id,
             taskState: outcome.settled ? task.status.state : a2a:TASK_STATE_WORKING};
+        if !outcome.settled {
+            conversation.stalledReplies = stalledReplies;
+            conversation.progress = progressOf(task);
+        }
         if contextId is string {
             conversation.contextId = contextId;
         }
@@ -498,11 +620,13 @@ isolated function agentBaseUrl(string url) returns string {
 }
 
 // Turns a name into the part of the tool name after `ask`: `tripPlanner` or "Trip Planner Agent" becomes
-// `TripPlanner` and `TripPlannerAgent`. A name longer than the limit is cut and ends in a hash of the whole name, so
-// two long names that start alike still differ.
+// `TripPlanner` and `TripPlannerAgent`. When letters outside ASCII were dropped, or nothing is left, or the result is
+// longer than the limit, it ends in a hash of the whole name, so names that differ only in what was dropped or cut
+// still give different tool names.
 isolated function toolSuffix(string name) returns string {
     string suffix = "";
     boolean startOfWord = true;
+    boolean droppedLetters = false;
     foreach string:Char ch in name {
         int codePoint = ch.toCodePointInt();
         boolean isAlnum = (codePoint >= 65 && codePoint <= 90) || (codePoint >= 97 && codePoint <= 122)
@@ -512,16 +636,17 @@ isolated function toolSuffix(string name) returns string {
             startOfWord = false;
         } else {
             startOfWord = true;
+            droppedLetters = droppedLetters || codePoint > 127;
         }
     }
+    string hash = crypto:hashSha256(name.toBytes()).toBase16().substring(0, 8);
     if suffix.length() == 0 {
-        return "Agent";
+        return "Agent" + hash;
     }
-    if suffix.length() <= A2A_MAX_NAME_PART_LENGTH {
-        return suffix;
+    if suffix.length() > A2A_MAX_NAME_PART_LENGTH || (droppedLetters && suffix.length() + 8 > A2A_MAX_NAME_PART_LENGTH) {
+        return suffix.substring(0, A2A_HASHED_PREFIX_LENGTH) + hash;
     }
-    string hash = crypto:hashSha256(suffix.toBytes()).toBase16().substring(0, 8);
-    return suffix.substring(0, A2A_HASHED_PREFIX_LENGTH) + hash;
+    return droppedLetters ? suffix + hash : suffix;
 }
 
 // What the remote agent says about itself, as text for the tool's description. All of it is the remote agent's own
@@ -533,8 +658,20 @@ isolated function describeAgent(a2a:AgentCard card) returns string {
     if card.skills.length() == 0 {
         return text;
     }
-    string[] entries = from a2a:AgentSkill skill in card.skills
-        select string `- ${describeSkill(skill)}`;
+    string[] entries = [];
+    int used = 0;
+    foreach a2a:AgentSkill skill in card.skills {
+        string entry = string `- ${describeSkill(skill)}`;
+        if entries.length() == A2A_MAX_SKILLS || used + entry.length() > A2A_MAX_SKILLS_TEXT_LENGTH {
+            break;
+        }
+        entries.push(entry);
+        used += entry.length();
+    }
+    int unlisted = card.skills.length() - entries.length();
+    if unlisted > 0 {
+        entries.push(string `- (${unlisted} more skills not listed)`);
+    }
     return string `${text} Its skills:\n${string:'join("\n", ...entries)}`;
 }
 
@@ -550,7 +687,7 @@ isolated function describeSkill(a2a:AgentSkill skill) returns string {
         full += string ` [tags: ${joinLines(skill.tags, ", ")}]`;
     }
     if examples.length() > 0 {
-        full += string ` [examples: ${joinLines(quoted(examples), "; ")}]`;
+        full += string ` [examples: ${string:'join("; ", ...quoted(examples))}]`;
     }
     if inputModes.length() > 0 {
         full += string ` [accepts: ${joinLines(inputModes, ", ")}]`;
@@ -563,7 +700,7 @@ isolated function describeSkill(a2a:AgentSkill skill) returns string {
     }
     string summary = string `${singleLine(skill.name, 80)}: ${singleLine(skill.description, 240)}`;
     if examples.length() > 0 {
-        summary += string ` [examples: ${joinLines(quoted(examples.slice(0, int:min(2, examples.length()))), "; ")}]`;
+        summary += string ` [examples: ${string:'join("; ", ...quoted(examples.slice(0, int:min(2, examples.length()))))}]`;
     }
     return string `${summary} [summarized: the skill's full text was over ${A2A_MAX_SKILL_TEXT_LENGTH} characters]`;
 }
@@ -576,7 +713,9 @@ isolated function joinLines(string[] texts, string separator) returns string =>
     string:'join(separator, ...from string text in texts
             select oneLine(text));
 
-isolated function oneLine(string text) returns string => regexp:replaceAll(re `\s+`, text, " ").trim();
+// One line, with double quotes turned into single quotes, so card text cannot close the quotes it is shown in.
+isolated function oneLine(string text) returns string =>
+    regexp:replaceAll(re `"`, regexp:replaceAll(re `\s+`, text, " "), "'").trim();
 
 // One line, at most `maxLength` characters, with a visible mark when it was cut.
 isolated function singleLine(string text, int maxLength) returns string {
@@ -584,11 +723,23 @@ isolated function singleLine(string text, int maxLength) returns string {
     return flat.length() <= maxLength ? flat : string `${flat.substring(0, maxLength)}... [truncated]`;
 }
 
-// Whether a task still looks exactly as it did in an earlier snapshot: same state and same status timestamp.
-// Every transition writes a fresh timestamp, so an agent that asks its question a second time is still seen to
-// have moved on, though its state is INPUT_REQUIRED both times.
-isolated function unchangedSince(a2a:Task before, a2a:Task now) returns boolean =>
-    before.status.state == now.status.state && before.status?.timestamp == now.status?.timestamp;
+// Whether a task still looks exactly as it did in an earlier snapshot: the same status, compared in full (state,
+// timestamp and message). An agent that asks a second question is seen to have moved on, though its state is
+// INPUT_REQUIRED both times, even when it sets no timestamps: the question itself differs.
+isolated function unchangedSince(a2a:Task before, a2a:Task now) returns boolean => before.status == now.status;
+
+// What a running task looks like, to tell a task that is progressing from one that is not: its state, its status
+// timestamp, and how many artifact parts it has produced.
+isolated function progressOf(a2a:Task task) returns string {
+    int parts = 0;
+    foreach a2a:Artifact artifact in task.artifacts ?: [] {
+        parts += artifact.parts.length();
+    }
+    return string `${task.status.state}|${task.status?.timestamp ?: ""}|${parts}`;
+}
+
+isolated function isTransportFailure(a2a:Error err) returns boolean =>
+    err is a2a:InternalError && err.message().startsWith("Transport-level failure");
 
 // AUTH_REQUIRED and INPUT_REQUIRED count as settled: both mean the agent is waiting on the caller, so there is
 // nothing more to wait for.
@@ -645,10 +796,16 @@ isolated function partsText(a2a:Part[] parts) returns string {
     return string:'join(" ", ...texts);
 }
 
-// An agent answers in artifacts when it finished and in a status message when it needs something, so both are read;
-// reading only one would come back empty depending on how the request happened to resolve. Every artifact is read,
+// An agent answers in artifacts when it finished, and says what it needs, or why it failed, in the status message.
+// A finished task is read from its artifacts first; any other state from its status message first, because a task
+// that asks a question or fails may already have produced artifacts that do not say so. Every artifact is read,
 // because an agent may split its answer over several.
 isolated function taskText(a2a:Task task) returns string {
+    a2a:Message? statusMessage = task.status?.message;
+    string status = statusMessage is a2a:Message ? partsText(statusMessage.parts) : "";
+    if task.status.state != a2a:TASK_STATE_COMPLETED && status.length() > 0 {
+        return status;
+    }
     a2a:Artifact[] artifacts = task.artifacts ?: [];
     string[] texts = from a2a:Artifact artifact in artifacts
         let string text = partsText(artifact.parts)
@@ -657,9 +814,8 @@ isolated function taskText(a2a:Task task) returns string {
     if texts.length() > 0 {
         return string:'join("\n", ...texts);
     }
-    a2a:Message? statusMessage = task.status?.message;
-    if statusMessage is a2a:Message {
-        return partsText(statusMessage.parts);
+    if status.length() > 0 {
+        return status;
     }
     return string `(no text in the reply; task state ${task.status.state})`;
 }
