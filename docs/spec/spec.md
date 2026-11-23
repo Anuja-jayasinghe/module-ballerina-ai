@@ -964,7 +964,8 @@ public isolated class A2aToolKit {
     *A2aBaseToolKit;
 
     public isolated function init(a2a:AgentCard|string agent, string? name = (), string? secret = (),
-            http:ClientConfiguration clientConfig = {}, RequiresApproval requiresApproval = false) returns Error?;
+            http:ClientConfiguration clientConfig = {}, map<string> headers = {},
+            RequiresApproval requiresApproval = false) returns Error?;
 
     public isolated function getTools() returns ToolConfig[];
 }
@@ -974,23 +975,26 @@ public isolated class A2aToolKit {
 
 | Parameter          | Type                       | Default  | Meaning                                                                                                                                                              |
 |--------------------|----------------------------|----------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `agent`            | `a2a:AgentCard\|string`    | Required | The base URL of the remote agent, or an `a2a:AgentCard`. A URL is resolved to the card with `a2a:resolveAgentCard`. A card is used as given and is not fetched again. |
+| `agent`            | `a2a:AgentCard\|string`    | Required | The base URL of the remote agent, the URL of its Agent Card (ending in `/.well-known/agent-card.json`), or an `a2a:AgentCard`. A URL is resolved to the card with `a2a:resolveAgentCard`. A card is used as given and is not fetched again. |
 | `name`             | `string?`                  | `()`     | The name the tool name is built from. `()` means the name in the Agent Card.                                                                                         |
-| `secret`           | `string?`                  | `()`     | The credential for the security scheme the card requires. `()` means no credential is sent.                                                                          |
-| `clientConfig`     | `http:ClientConfiguration` | `{}`     | Used both to fetch the card from a URL and by the client that calls the remote agent. Its `timeout` is also how long a task's stream may stay silent (4.3.4.5). |
+| `secret`           | `string?`                  | `()`     | The credential for the security scheme the card requires. It is not sent when fetching the card. `()` means no credential is sent.                                   |
+| `clientConfig`     | `http:ClientConfiguration` | `{}`     | Used both to fetch the card from a URL and by the client that calls the remote agent. Its `auth` is sent with every request (4.3.4.7). Its `timeout` is also how long a task's stream may stay silent (4.3.4.5). |
+| `headers`          | `map<string>`              | `{}`     | Headers sent with every request, the card fetch included, such as an API key header (4.3.4.7).                                                                        |
 | `requiresApproval` | `ai:RequiresApproval`      | `false`  | Passed to the tool. `true` pauses every call for human approval; a function receives the proposed `request` and decides per call.                                     |
 
 ##### 4.3.4.2. Initialization
 
-1. The toolkit obtains the Agent Card. If `agent` is a URL, the card is fetched with `clientConfig`. The card is read
-   once. Changes to the remote agent after this point are not seen by the toolkit.
+1. The toolkit obtains the Agent Card. If `agent` is a URL, the card is fetched with `clientConfig` and `headers`. A
+   URL ending in `/.well-known/agent-card.json` is the card's own URL, and the rest of it is the base URL. The card is
+   read once. Changes to the remote agent after this point are not seen by the toolkit.
 2. The toolkit determines the security scheme for `secret`. If the card has one or more security requirements, the
    first requirement is used. If it names exactly one scheme, `secret` is filed under that scheme. If it names more
    than one scheme, initialization fails, because a single `secret` cannot satisfy several schemes. If `secret` is
    given and the card declares no scheme, initialization fails.
 3. The card MUST list an interface whose `protocolBinding` is `HTTP+JSON`. No other binding is supported.
-4. The toolkit creates an `a2a:RestClient` from the card. A card passed as an `a2a:AgentCard` is the card in use, so a
-   caller can verify the card's signature before passing it.
+4. The toolkit creates an `a2a:RestClient` from the card, with `clientConfig` and `headers`. Every call goes to the
+   URL of the card's `HTTP+JSON` interface. A card passed as an `a2a:AgentCard` is the card in use, so a caller can
+   verify the card's signature before passing it.
 5. When the card sets `capabilities.extendedAgentCard` and `secret` is given, the toolkit reads the extended Agent Card
    and describes the tool from it. If the extended card cannot be read, a warning is logged and the public card is
    used.
@@ -1092,8 +1096,38 @@ next request starts a new conversation.
 | `secret` is given and the card declares no security scheme                        | `ai:Error` from `init`                                               |
 | The client cannot be created from the card                                        | `ai:Error` from `init`, with the cause                               |
 | A call to the remote agent fails before it reports a task, for example with an authentication failure | An `ai:Error` naming the tool, with the `a2a:Error` as its cause, returned from the tool and reported to the model |
+| The remote agent cannot be reached at all                                         | As above; the message also names the URL from the card that was called |
 
-##### 4.3.4.7. Security considerations
+##### 4.3.4.7. Agents behind a gateway
+
+In production a remote agent is usually reached through an API gateway, which checks a credential on every request,
+the Agent Card included, while the agent behind it declares no security scheme of its own. `secret` does not fit that
+case, because it is filed under a scheme the card declares and is not sent when fetching the card. Use one of these
+instead; both are sent with every request, the card fetch included:
+
+| The gateway asks for                                   | Configure                                                                                         |
+|--------------------------------------------------------|---------------------------------------------------------------------------------------------------|
+| A bearer token                                         | `clientConfig = {auth: {token: accessToken}}`                                                     |
+| An OAuth2 token, such as a client-credentials grant    | `clientConfig = {auth: {tokenUrl, clientId, clientSecret, scopes}}`. The token is fetched when needed and fetched again when it expires. |
+| An API key in a header                                 | `headers = {"X-API-Key": apiKey}`, with the header name the gateway uses                          |
+| Basic authentication or a self-signed JWT              | The matching `http:ClientConfiguration.auth` configuration                                        |
+| A client certificate (mutual TLS)                      | `clientConfig = {secureSocket: {key: {certFile, keyFile}}}`                                       |
+
+The gateway MUST serve a card whose `HTTP+JSON` interface URL is the gateway's own address for the agent; a card
+that lists the agent's internal address cannot be called from outside. A gateway that cuts long responses ends the
+stream before the task settles; the result is then `[WORKING]`, and the next call picks the task up (4.3.4.5).
+
+```ballerina
+final ai:A2aToolKit planner = check new ("https://gateway.example.com/agents/planner",
+    clientConfig = {auth: {tokenUrl: "https://idp.example.com/oauth2/token", clientId, clientSecret}});
+final ai:A2aToolKit weather = check new ("https://gateway.example.com/agents/weather",
+    headers = {"X-API-Key": weatherApiKey});
+```
+
+Requests signed per call, such as AWS Signature Version 4, are not supported, because `http:ClientConfiguration` has
+no way to sign a request.
+
+##### 4.3.4.8. Security considerations
 
 * Everything in the Agent Card is written by whoever operates the remote agent and becomes part of the prompt of the
   calling agent. The toolkit flattens it, caps the description, and labels it as the remote agent's own text. This

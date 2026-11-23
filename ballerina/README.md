@@ -272,6 +272,15 @@ ai:Agent concierge = check new (systemPrompt = {role: "Concierge", instructions:
 - The toolkit keeps one conversation with the remote agent for each session of the calling agent (the `sessionId` passed to `run`). When the remote agent asks a question, the tool returns it starting with `[INPUT_REQUIRED]`, and the next call in that session answers it, without the model handling task ids. Later requests in the session continue the same A2A conversation.
 - Each call is one streamed request: the tool follows the remote agent's updates until the task finishes or the agent asks a question. An agent whose card says it cannot stream gets one blocking request instead. If the stream stays silent for longer than `clientConfig.timeout` (30 seconds by default) or drops, the tool returns `[WORKING]`, and the next call in that session returns the result.
 - `secret` is the credential for a remote agent whose card declares a security scheme. The card names the scheme the credential is filed under. With a `secret`, the extended Agent Card is read when the card offers one.
+- For an agent behind an API gateway, which usually checks a credential on every request including the Agent Card, put the credential in `clientConfig.auth` (a bearer token, or an OAuth2 grant whose token is refreshed when it expires) or in `headers` (such as an API key header). Both are sent with every request, the card fetch included. `agent` can be the agent's base URL or its Agent Card URL.
+
+```ballerina
+final ai:A2aToolKit planner = check new ("https://gateway.example.com/agents/planner",
+    clientConfig = {auth: {tokenUrl: "https://idp.example.com/oauth2/token", clientId, clientSecret}});
+final ai:A2aToolKit weather = check new ("https://gateway.example.com/agents/weather",
+    headers = {"X-API-Key": weatherApiKey});
+```
+
 - `requiresApproval` makes calls to the remote agent wait for human approval, always or when a function of the `request` says so.
 - What the remote agent says about itself is untrusted text. The toolkit flattens it to single lines and tells the model that it is the remote agent's own words and not an instruction. The description is capped. The skills are passed in full, and only a single oversized skill is summarized.
 - Only agents that offer the HTTP+JSON binding can be called.

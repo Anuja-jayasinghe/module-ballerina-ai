@@ -33,6 +33,9 @@ const int A2A_MAX_CARD_TEXT_LENGTH = 1024;
 // A skill is passed in full unless its text is longer than this, in which case only that skill is summarized.
 const int A2A_MAX_SKILL_TEXT_LENGTH = 4096;
 
+// Where an agent serves its Agent Card, relative to its base URL.
+const string A2A_CARD_PATH = "/.well-known/agent-card.json";
+
 // How many conversations one toolkit remembers. Past this, the conversation used least recently is forgotten, and
 // its next request starts a new conversation with the remote agent.
 const int A2A_MAX_CONVERSATIONS = 1000;
@@ -81,6 +84,9 @@ public isolated class A2aToolKit {
     private final a2a:RestClient agentClient;
     private final ToolConfig[] & readonly tools;
     private final string toolName;
+    // Where the card says calls go. Named in transport failures: behind a gateway, a card that still lists the
+    // agent's internal address is the usual cause.
+    private final string agentUrl;
     private final map<A2aConversation & readonly> conversations = {};
     // Session ids, least recently used first, to forget the oldest conversation once there are too many.
     private final string[] sessionOrder = [];
@@ -93,26 +99,34 @@ public isolated class A2aToolKit {
     # is given, the extended card is read too, and its skills are the ones the tool describes. If it cannot be read,
     # the public card is used.
     #
-    # + agent - Base URL of the remote agent, or an `a2a:AgentCard` to use as given
+    # + agent - Base URL of the remote agent, such as `https://gateway.example.com/agents/planner`, or the URL of its
+    #           Agent Card (ending in `/.well-known/agent-card.json`), or an `a2a:AgentCard` to use as given
     # + name - Name the tool name is built from, such as `tripPlanner` for `askTripPlanner`. Defaults to the name in
     #          the Agent Card
     # + secret - Credential for a remote agent whose card declares a security scheme. The card names the scheme the
-    #            credential is filed under, so only the credential is given
-    # + clientConfig - Configuration for fetching the card and for the client, such as `httpVersion`, `timeout`, and
-    #                  TLS settings. `timeout` is also how long a task's stream may stay silent; a task that is silent
-    #                  for longer is reported as still running and picked up by the next call
+    #            credential is filed under, so only the credential is given. It is not sent when fetching the card;
+    #            for an agent behind a gateway that protects the card too, use `clientConfig.auth` or `headers`
+    # + clientConfig - Configuration for fetching the card and for every call, such as `auth`, `timeout`, and TLS
+    #                  settings. `auth` is sent with every request, the card fetch included: a bearer token, or an
+    #                  OAuth2 grant whose token is fetched and refreshed as needed. `timeout` is also how long a task's
+    #                  stream may stay silent; a task that is silent for longer is reported as still running and
+    #                  picked up by the next call
+    # + headers - Headers sent with every request, the card fetch included, such as the API key header a gateway
+    #             asks for
     # + requiresApproval - Whether a call to the tool needs human approval first. A function gets the proposed
     #                      `request` and decides per call
     # + return - An `ai:Error` if the Agent Card cannot be read, if the remote agent offers no HTTP+JSON interface, if
     #            the card requires several security schemes together, if `secret` is given and the card declares no
     #            security scheme
     public isolated function init(a2a:AgentCard|string agent, string? name = (), string? secret = (),
-            http:ClientConfiguration clientConfig = {}, RequiresApproval requiresApproval = false) returns Error? {
+            http:ClientConfiguration clientConfig = {}, map<string> headers = {},
+            RequiresApproval requiresApproval = false) returns Error? {
         a2a:AgentCard card;
         if agent is a2a:AgentCard {
             card = agent;
         } else {
-            a2a:AgentCard|error resolved = a2a:resolveAgentCard(agent, clientConfig = clientConfig);
+            a2a:AgentCard|error resolved = a2a:resolveAgentCard(agentBaseUrl(agent), headers,
+                    clientConfig = clientConfig);
             if resolved is error {
                 return error Error(string `could not resolve the Agent Card for ${agent} (${resolved.message()})`);
             }
@@ -125,9 +139,9 @@ public isolated class A2aToolKit {
 
         string displayName = singleLine(name ?: card.name, A2A_MAX_NAME_PART_LENGTH * 2);
         string? schemeName = check schemeFor(card, displayName, secret);
-        check requireHttpJson(card, displayName);
+        self.agentUrl = check requireHttpJson(card, displayName);
 
-        a2a:RestClient|error agentClient = connect(card, schemeName, secret, clientConfig);
+        a2a:RestClient|error agentClient = connect(card, schemeName, secret, clientConfig, headers);
         if agentClient is error {
             return error Error(string `could not connect to agent "${displayName}" (${agentClient.message()})`);
         }
@@ -193,7 +207,7 @@ public isolated class A2aToolKit {
                 // The agent could not be reached or failed; the task may still be running, so the conversation is
                 // kept and nothing new is sent.
                 return error Error(string `agent call "${self.toolName}" failed while reading the earlier request: `
-                    + pending.message(), pending);
+                    + self.describe(pending), pending);
             }
             if pending is a2a:Task {
                 A2aOutcome outcome = isSettled(pending.status.state)
@@ -250,11 +264,11 @@ public isolated class A2aToolKit {
             continuation = false;
         }
         if result is a2a:Error {
-            return error Error(string `agent call "${self.toolName}" failed: ${result.message()}`, result);
+            return error Error(string `agent call "${self.toolName}" failed: ${self.describe(result)}`, result);
         }
         A2aOutcome|a2a:Message|a2a:Error outcome = self.read(result, continuation);
         if outcome is a2a:Error {
-            return error Error(string `agent call "${self.toolName}" failed: ${outcome.message()}`, outcome);
+            return error Error(string `agent call "${self.toolName}" failed: ${self.describe(outcome)}`, outcome);
         }
         if outcome is A2aOutcome {
             self.remember(session, outcome);
@@ -267,6 +281,12 @@ public isolated class A2aToolKit {
         self.store(session, replyContextId is string ? {contextId: replyContextId} : {});
         return partsText(reply.parts);
     }
+
+    // An error's message, with the address that was called when the agent could not be reached at all.
+    private isolated function describe(a2a:Error err) returns string =>
+        err is a2a:InternalError && err.message().startsWith("Transport-level failure")
+            ? string `${err.message()} (calling ${self.agentUrl}, the address in the agent's card)`
+            : err.message();
 
     // What the model reads for a task. A finished task is its answer alone; every other state is named, with what
     // to do next, because the model cannot see the task.
@@ -445,12 +465,12 @@ isolated function schemeFor(a2a:AgentCard card, string displayName, string? secr
 }
 
 // Only the HTTP+JSON binding is supported. Saying so when the toolkit is created is clearer than a failure on the
-// first call.
-isolated function requireHttpJson(a2a:AgentCard card, string displayName) returns Error? {
+// first call. Returns the URL the card gives for that binding, which is where every call goes.
+isolated function requireHttpJson(a2a:AgentCard card, string displayName) returns string|Error {
     string[] offered = [];
     foreach a2a:AgentInterface iface in card.supportedInterfaces {
         if iface.protocolBinding == "HTTP+JSON" {
-            return;
+            return iface.url;
         }
         offered.push(iface.protocolBinding);
     }
@@ -462,12 +482,19 @@ isolated function requireHttpJson(a2a:AgentCard card, string displayName) return
 // Builds the client from the card already in hand, so the card is not fetched again and a caller-supplied,
 // signature-verified card stays the card in use.
 isolated function connect(a2a:AgentCard card, string? schemeName, string? secret,
-        http:ClientConfiguration clientConfig) returns a2a:RestClient|error {
+        http:ClientConfiguration clientConfig, map<string> headers) returns a2a:RestClient|error {
     if schemeName is string && secret is string {
         a2a:InMemoryCredentialStore store = new ({[schemeName]: secret});
-        return new (card, clientConfig = clientConfig, credentials = store);
+        return new (card, clientConfig = clientConfig, headers = headers, credentials = store);
     }
-    return new (card, clientConfig = clientConfig);
+    return new (card, clientConfig = clientConfig, headers = headers);
+}
+
+// The agent's base URL. The card URL is accepted too, since gateways and registries often hand that out.
+isolated function agentBaseUrl(string url) returns string {
+    string trimmed = url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
+    return trimmed.endsWith(A2A_CARD_PATH) ? trimmed.substring(0, trimmed.length() - A2A_CARD_PATH.length())
+        : trimmed;
 }
 
 // Turns a name into the part of the tool name after `ask`: `tripPlanner` or "Trip Planner Agent" becomes
